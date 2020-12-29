@@ -7,6 +7,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use crate::directory::node;
+use crate::directory::node::Node;
 use crate::future::FdbSlice;
 use crate::tuple::hca::HighContentionAllocator;
 use crate::tuple::{pack_into, Subspace};
@@ -59,20 +60,30 @@ impl Default for DirectoryLayer {
 }
 
 impl DirectoryLayer {
-    fn get_path(&self) -> Vec<String> {
-        self.path.to_owned()
-    }
-
-    fn get_layer(&self) -> Vec<u8> {
-        self.layer.to_owned()
-    }
-
     pub async fn create_or_open(
         &self,
         txn: &Transaction,
         paths: Vec<String>,
     ) -> Result<Subspace, DirectoryError> {
         self.create_or_open_internal(txn, paths, vec![], vec![], true, true)
+            .await
+    }
+
+    pub async fn create(
+        &self,
+        txn: &Transaction,
+        paths: Vec<String>,
+    ) -> Result<Subspace, DirectoryError> {
+        self.create_or_open_internal(txn, paths, vec![], vec![], true, false)
+            .await
+    }
+
+    pub async fn open(
+        &self,
+        txn: &Transaction,
+        paths: Vec<String>,
+    ) -> Result<Subspace, DirectoryError> {
+        self.create_or_open_internal(txn, paths, vec![], vec![], false, true)
             .await
     }
 
@@ -103,11 +114,15 @@ impl DirectoryLayer {
             return Err(DirectoryError::NoPathProvided);
         }
 
-        let mut node = self.find(trx, paths.to_owned()).await?;
-        node.prefetch_metadata(trx).await?;
+        let nodes = self.find_nodes(trx, paths.to_owned()).await?;
 
-        // subspace already exists
-        if node.content_subspace.is_some() {
+        let last_node = nodes.last().expect("could not contain 0 nodes");
+
+        // if the node_subspace of the last element exists, then we do not need to create anything
+        // and we can return it directly
+        if last_node.content_subspace.is_some() {
+            let node = nodes.last().expect("could not contain 0 node");
+
             if !allow_open {
                 return Err(DirectoryError::DirAlreadyExists);
             }
@@ -116,34 +131,21 @@ impl DirectoryLayer {
                 node.check_layer(layer)?;
             }
 
-            return Ok(node.content_subspace.unwrap().to_owned());
+            return Ok(node.content_subspace.clone().unwrap());
         }
 
-        // subspace does not exists
+        // at least one node does not exists, we need to create them
         if !allow_create {
             return Err(DirectoryError::DirNotExists);
         }
 
-        if prefix.len() > 0 {
-            unimplemented!("no prefix allowed yet")
+        let mut subspace = self.content_subspace.clone();
+
+        for mut node in nodes {
+            let allocator = self.allocator.allocate(trx).await?;
+            subspace = node.create_subspace(&trx, allocator, &subspace).await?;
         }
-
-        if paths.len() != 1 {
-            unimplemented!("paths too long for now")
-        }
-
-        let allocator = self.allocator.allocate(trx).await?;
-        let new_subspace = self.content_subspace.subspace(&allocator);
-
-        // store node in the node_subspace
-        let mut new_node_key = vec![DEFAULT_SUB_DIRS];
-        pack_into(paths.get(0).unwrap(), &mut new_node_key);
-        trx.set(
-            self.node_subspace.subspace(&new_node_key).bytes(),
-            new_subspace.bytes(),
-        );
-
-        Ok(new_subspace)
+        Ok(subspace)
     }
 
     async fn check_version(
@@ -195,42 +197,46 @@ impl DirectoryLayer {
         value.write_u32::<LittleEndian>(MINOR_VERSION).unwrap();
         value.write_u32::<LittleEndian>(PATCH_VERSION).unwrap();
         let version_subspace: &[u8] = b"version";
-        let version_key = self.node_subspace.subspace(&version_subspace);
-
-        trx.set(version_key.bytes(), &value);
+        let directory_version_key = self.node_subspace.subspace(&version_subspace);
+        trx.set(directory_version_key.bytes(), &value);
 
         Ok(())
     }
 
-    async fn find(&self, trx: &Transaction, path: Vec<String>) -> Result<node::Node, FdbError> {
-        let mut node = node::Node {
-            subspace: self.node_subspace.to_owned(),
-            path: path.to_owned(),
-            target_path: vec![],
-            layer: None,
-            content_subspace: None,
-            already_fetched_metadata: false,
-        };
-        for path_name in path.to_owned() {
+    /// walk is crawling the node_subspace and searching for the nodes
+    /// Result will hold a Vec with at least two nodes: root node and as many nodes as paths
+    async fn find_nodes(
+        &self,
+        trx: &Transaction,
+        paths: Vec<String>,
+    ) -> Result<Vec<node::Node>, FdbError> {
+        let mut nodes = vec![];
+
+        let mut subspace = self.node_subspace.to_owned();
+
+        for path_name in paths {
             let mut next_node_key = vec![DEFAULT_SUB_DIRS];
             pack_into(&path_name, &mut next_node_key);
-            let next_node_subspace = node.subspace.subspace(&next_node_key);
+            subspace = subspace.subspace(&next_node_key);
 
-            match trx.get(next_node_subspace.bytes(), false).await? {
-                None => {
-                    if !path.ends_with(&[path_name]) {
-                        unimplemented!("node not found")
-                    }
-                }
+            let mut node = Node {
+                layer: None,
+                node_subspace: subspace.to_owned(),
+                content_subspace: None,
+            };
+
+            node.retrieve_layer(&trx).await?;
+
+            match trx.get(node.node_subspace.bytes(), false).await? {
                 Some(fdb_slice) => {
-                    node.subspace = next_node_subspace;
                     node.content_subspace = Some(Subspace::from_bytes(&*fdb_slice));
-                    node.path.push(path_name.to_owned());
                 }
+                _ => {} // noop in case of a none existing node
             }
+            nodes.push(node);
         }
 
-        Ok(node)
+        Ok(nodes)
     }
 
     async fn get_version_value(&self, trx: &Transaction) -> FdbResult<Option<FdbSlice>> {

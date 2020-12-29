@@ -10,14 +10,10 @@ use crate::tuple::Subspace;
 use crate::{DirectoryError, FdbError, Transaction};
 
 pub(crate) struct Node {
-    pub(crate) subspace: Subspace,
-    pub(crate) path: Vec<String>,
-    pub(crate) target_path: Vec<String>,
     pub(crate) layer: Option<Vec<u8>>,
 
+    pub(crate) node_subspace: Subspace,
     pub(crate) content_subspace: Option<Subspace>,
-
-    pub(crate) already_fetched_metadata: bool,
 }
 
 impl Node {
@@ -34,23 +30,30 @@ impl Node {
         }
     }
 
-    // TODO: https://docs.rs/futures/0.3.4/futures/future/trait.FutureExt.html#method.shared
-    pub(crate) async fn prefetch_metadata(&mut self, trx: &Transaction) -> Result<(), FdbError> {
-        if !self.already_fetched_metadata {
-            self.layer(trx).await?;
-            self.already_fetched_metadata = true;
-        }
-        Ok(())
+    pub(crate) async fn create_subspace(
+        &mut self,
+        trx: &Transaction,
+        allocator: i64,
+        parent_subspace: &Subspace,
+    ) -> Result<Subspace, DirectoryError> {
+        let new_subspace = parent_subspace.subspace(&allocator);
+
+        let key = self.node_subspace.to_owned();
+        trx.set(key.bytes(), new_subspace.bytes());
+
+        self.content_subspace = Some(new_subspace.to_owned());
+
+        Ok(new_subspace.clone())
     }
 
     // retrieve the layer used for this node
-    pub(crate) async fn layer(&mut self, trx: &Transaction) -> Result<(), FdbError> {
+    pub(crate) async fn retrieve_layer(&mut self, trx: &Transaction) -> Result<(), FdbError> {
         if self.layer == None {
-            let key = self.subspace.subspace(&b"layer".to_vec());
+            let key = self.node_subspace.subspace(&b"layer".to_vec());
             self.layer = match trx.get(key.bytes(), false).await {
                 Ok(None) => Some(vec![]),
                 Err(err) => return Err(err),
-                Ok(Some(fv)) => Some(fv.to_vec()),
+                Ok(Some(fdb_slice)) => Some(fdb_slice.to_vec()),
             }
         }
         Ok(())
