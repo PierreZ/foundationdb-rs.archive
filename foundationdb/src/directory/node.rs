@@ -15,7 +15,7 @@ pub(crate) struct Node {
     pub(crate) target_path: Vec<String>,
     pub(crate) layer: Option<Vec<u8>>,
 
-    pub(crate) exists: bool,
+    pub(crate) content_subspace: Option<Subspace>,
 
     pub(crate) already_fetched_metadata: bool,
 }
@@ -50,16 +50,9 @@ impl Node {
             self.layer = match trx.get(key.bytes(), false).await {
                 Ok(None) => Some(vec![]),
                 Err(err) => return Err(err),
-                Ok(Some(fv)) => {
-                    self.exists = true;
-                    Some(fv.to_vec())
-                }
+                Ok(Some(fv)) => Some(fv.to_vec()),
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn get_content_subspace(&self) -> Result<Subspace, DirectoryError> {
-        unimplemented!("get content subspace");
     }
 }
