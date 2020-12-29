@@ -114,11 +114,11 @@ pub mod tuple;
 pub use crate::cluster::Cluster;
 
 pub use crate::database::*;
+pub use crate::directory::*;
 pub use crate::error::FdbError;
 pub use crate::error::FdbResult;
 pub use crate::keyselector::*;
 pub use crate::transaction::*;
-pub use crate::directory::*;
 
 /// Initialize the FoundationDB Client API, this can only be called once per process.
 ///

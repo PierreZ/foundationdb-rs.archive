@@ -1,151 +1,161 @@
-use crate::Transaction;
-use crate::tuple::{Subspace, pack_into, pack};
-use crate::tuple::hca::HighContentionAllocator;
+// Copyright 2018 foundationdb-rs developers, https://github.com/Clikengo/foundationdb-rs/graphs/contributors
+// Copyright 2013-2018 Apple, Inc and the FoundationDB project authors.
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 
-use super::*;
-use std::result;
+use crate::directory::node;
+use crate::future::FdbSlice;
+use crate::tuple::hca::HighContentionAllocator;
+use crate::tuple::{pack_into, Subspace};
 use crate::DirectoryError::Version;
-use crate::directory::directory_subspace::{DirectorySubspaceResult, DirectorySubspace};
+use crate::{DirectoryError, FdbError, FdbResult, Transaction};
+use byteorder::{LittleEndian, WriteBytesExt};
+
+
+
 
 const LAYER_VERSION: (u8, u8, u8) = (1, 0, 0);
 const MAJOR_VERSION: u32 = 1;
 const MINOR_VERSION: u32 = 0;
 const PATCH_VERSION: u32 = 0;
-const DEFAULT_NODE_PREFIX:&[u8] =  b"\xFE";
+const DEFAULT_NODE_PREFIX: &[u8] = b"\xFE";
+const DEFAULT_HCA_PREFIX: &[u8] = b"hca";
+const DEFAULT_SUB_DIRS: u8 = 0;
 
-const SUBDIRS:u8 = 0;
-
-#[derive(PartialEq)]
-enum PermissionLevel {
-    Read,
-    Write
-}
-
-pub type DirectoryResult = result::Result<Directory, DirectoryError>;
-
-pub struct Directory {
-    node_prefix: Subspace,
-    content_prefix: Subspace,
-
-    allow_manual_prefixes: bool,
+/// Provides a class for managing directories in FoundationDB.
+/// The FoundationDB API provides directories as a tool for managing related Subspaces.
+/// Directories are a recommended approach for administering applications. Each application should create or open at least one directory to manage its subspaces.
+/// For general guidance on directory usage, see the discussion in the Developer Guide.
+///
+/// Directories are identified by hierarchical paths analogous to the paths in a Unix-like file system.
+/// A path is represented as a List of strings. Each directory has an associated subspace used to store its content.
+/// The layer maps each path to a short prefix used for the corresponding subspace.
+/// In effect, directories provide a level of indirection for access to subspaces.
+pub struct DirectoryLayer {
+    node_subspace: Subspace,
+    content_subspace: Subspace,
 
     allocator: HighContentionAllocator,
-    root_node: Subspace,
+
+    allow_manual_prefixes: bool,
 
     path: Vec<String>,
     layer: Vec<u8>,
 }
 
-impl Directory {
-
-    pub fn root() -> Directory {
-        Directory {
-            node_prefix: DEFAULT_NODE_PREFIX.into(),
-            content_prefix: Subspace::from_bytes(b""),
-
+impl Default for DirectoryLayer {
+    fn default() -> Self {
+        DirectoryLayer {
+            node_subspace: Subspace::from_bytes(DEFAULT_NODE_PREFIX),
+            content_subspace: Subspace::all(),
+            allocator: HighContentionAllocator::new(
+                Subspace::from_bytes(DEFAULT_NODE_PREFIX).subspace(&DEFAULT_HCA_PREFIX),
+            ),
             allow_manual_prefixes: false,
-
-            allocator: HighContentionAllocator::new(Subspace::from_bytes(b"hca")),
-            root_node: DEFAULT_NODE_PREFIX.into(),
-
-            path: Vec::new(),
-            layer: Vec::new()
+            path: vec![],
+            layer: vec![],
         }
     }
+}
 
-    pub fn contents_of_node(&self, node: Subspace, path: &[String], layer: &[u8]) -> DirectorySubspaceResult {
-
-
-        Ok(DirectorySubspace)
+impl DirectoryLayer {
+    fn get_path(&self) -> Vec<String> {
+        self.path.to_owned()
     }
 
-    // pub fn new(parent_node: Directory, path: &[String], layer: &[u8]) -> Directory {
-    //     Directory {
-    //
-    //         allow_manual_prefixes: true,
-    //
-    //         allocator: HighContentionAllocator::new(Subspace::from_bytes(b"hca")),
-    //
-    //         root_node: parent_node.node_prefix.clone(),
-    //         path: path.to_vec(),
-    //         layer: layer.to_vec(),
-    //
-    //     }
-    //
-    // }
+    fn get_layer(&self) -> Vec<u8> {
+        self.layer.to_owned()
+    }
 
-    pub async fn create_or_open(&self, trx: Transaction, path: &[&str], layer: &[u8], prefix: &[u8], allow_create: bool, allow_open: bool) -> DirectoryResult {
-        self.check_version(&trx, PermissionLevel::Read).await?;
+    pub async fn create_or_open(
+        &self,
+        txn: &Transaction,
+        paths: Vec<String>,
+    ) -> Result<Subspace, DirectoryError> {
+        self.create_or_open_internal(txn, paths, vec![], vec![], true, true)
+            .await
+    }
+
+    async fn create_or_open_internal(
+        &self,
+        trx: &Transaction,
+        paths: Vec<String>,
+        prefix: Vec<u8>,
+        layer: Vec<u8>,
+        allow_create: bool,
+        allow_open: bool,
+    ) -> Result<Subspace, DirectoryError> {
+        self.check_version(trx, allow_create).await?;
 
         if prefix.len() > 0 && !self.allow_manual_prefixes {
             if self.path.len() == 0 {
-                return Err(DirectoryError::Message("cannot specify a prefix unless manual prefixes are enabled".to_string()))
+                return Err(DirectoryError::Message(
+                    "cannot specify a prefix unless manual prefixes are enabled".to_string(),
+                ));
             }
 
-            return Err(DirectoryError::Message("cannot specify a prefix in a partition".to_string()))
+            return Err(DirectoryError::Message(
+                "cannot specify a prefix in a partition".to_string(),
+            ));
         }
 
-        if path.len() == 0 {
-            return Err(DirectoryError::CannotOpenRoot)
+        if paths.len() == 0 {
+            return Err(DirectoryError::NoPathProvided);
         }
 
-        // FIND
+        let mut node = self.find(trx, paths.to_owned()).await?;
+        node.prefetch_metadata(trx).await?;
 
+        // subspace already exists
+        if node.exists {
+            if !allow_open {
+                return Err(DirectoryError::DirAlreadyExists);
+            }
+
+            if layer.len() > 0 {
+                node.check_layer(layer)?;
+            }
+
+            return node.get_content_subspace();
+        }
+
+        // subspace does not exists
         if !allow_create {
-            return Err(DirectoryError::NotExist)
+            return Err(DirectoryError::DirNotExists);
         }
 
-        // self.initialize_directory(&trx);
-
-        if prefix.len() == 0 {
-            // let new_subspace = self.allocator.allocate(&trx).await?;
-            // TODO: maybe check range and prefix free but I think the allocate does that already
-        } else {
-            let is_prefix_free = self.is_prefix_free(&trx, prefix).await?;
+        if prefix.len() > 0 {
+            unimplemented!("no prefix allowed yet")
         }
-        //
-        // if layer != self.get_layer() && layer != &[] {
-        //     return Err(DirectoryError::LayerMismatch);
-        // }
 
-        Ok(Directory::root())
+        if paths.len() != 1 {
+            unimplemented!("paths too long for now")
+        }
+
+        let allocator = self.allocator.allocate(trx).await?;
+        let new_subspace = self.content_subspace.subspace(&allocator);
+
+        // TODO: store mapping between path and the i64 generated by the HCA
+
+        Ok(new_subspace)
     }
 
-    // pub async fn find(&self, trx: Transaction, path: &[&str]) -> DirectoryResult {
-    //
-    // }
-
-    // pub async fn initialize_directory(&self, trx: &Transaction) {
-    //     let version = [MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION].to_le_bytes();
-    //     let version_subspace: &[u8] =  b"version";
-    //     let version_key = self.root_node.subspace(&version_subspace);
-    //
-    //     trx.set(version_key.bytes(), version).await;
-    // }
-
-    async fn is_prefix_free(&self, trx: &Transaction, prefix: &[u8]) -> Result<bool, DirectoryError> {
-
-        if prefix.len() == 0 {
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-
-
-    async fn check_version(&self, trx: &Transaction, perm_level: PermissionLevel ) -> Result<(), DirectoryError> {
-        let version_subspace: &[u8] =  b"version";
-        let version_key = self.root_node.subspace(&version_subspace);
-        let version_opt = trx.get(version_key.bytes(), false).await?;
-
-        match version_opt {
+    async fn check_version(
+        &self,
+        trx: &Transaction,
+        allow_creation: bool,
+    ) -> Result<(), DirectoryError> {
+        let version = self.get_version_value(trx).await?;
+        match version {
             None => {
-                if perm_level == PermissionLevel::Write {
-                    //init
-                    return Err(Version("fix soon".to_string()));
+                if allow_creation {
+                    self.initialize_directory(trx).await
+                } else {
+                    Err(DirectoryError::DirNotExists)
                 }
-
-                Ok(())
             }
             Some(versions) => {
                 if versions.len() < 12 {
@@ -153,22 +163,22 @@ impl Directory {
                 }
                 let mut arr = [0u8; 4];
                 arr.copy_from_slice(&versions[0..4]);
-                let major: u32 = u32::from_be_bytes(arr);
+                let major: u32 = u32::from_le_bytes(arr);
 
                 arr.copy_from_slice(&versions[4..8]);
-                let minor: u32 = u32::from_be_bytes(arr);
+                let minor: u32 = u32::from_le_bytes(arr);
 
                 arr.copy_from_slice(&versions[8..12]);
-                let patch: u32 = u32::from_be_bytes(arr);
+                let patch: u32 = u32::from_le_bytes(arr);
 
                 if major > MAJOR_VERSION {
                     let msg = format!("cannot load directory with version {}.{}.{} using directory layer {}.{}.{}", major, minor, patch, MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION);
-                    return Err(Version(msg))
+                    return Err(Version(msg));
                 }
 
-                if minor > MINOR_VERSION && perm_level == PermissionLevel::Write {
+                if minor > MINOR_VERSION {
                     let msg = format!("directory with version {}.{}.{} is read-only when opened using directory layer {}.{}.{}", major, minor, patch, MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION);
-                    return Err(Version(msg))
+                    return Err(Version(msg));
                 }
 
                 Ok(())
@@ -176,34 +186,52 @@ impl Directory {
         }
     }
 
-    // pub async fn find(&self, trx: &Transaction, path: &[&str]) -> DirectoryResult {
-    //     let mut node = Directory::root();
-    //
-    //     for path_name in path {
-    //         let mut node_layer_id = vec!(SUBDIRS);
-    //         pack_into(&path_name, &mut node_layer_id);
-    //         let new_node = node.node_prefix.subspace(&node_layer_id);
-    //
-    //         match trx.get(new_node.bytes(), false).await {
-    //             Err(_) => {
-    //                 return Ok(node);
-    //             }
-    //             Result(node_name) => {
-    //                 let ss = node.node_with_prefix(key);
-    //                 node.node_prefix = ss;
-    //                 node.path.push(path_name.to_string())
-    //             }
-    //         }
-    //     }
-    //
-    //
-    //     Ok(node)
-    // }
+    async fn initialize_directory(&self, trx: &Transaction) -> Result<(), DirectoryError> {
+        let mut value = vec![];
+        value.write_u32::<LittleEndian>(MAJOR_VERSION).unwrap();
+        value.write_u32::<LittleEndian>(MINOR_VERSION).unwrap();
+        value.write_u32::<LittleEndian>(PATCH_VERSION).unwrap();
+        let version_subspace: &[u8] = b"version";
+        let version_key = self.node_subspace.subspace(&version_subspace);
 
+        trx.set(version_key.bytes(), &value);
 
+        Ok(())
+    }
 
-    pub fn get_layer(&self) -> &[u8] {
-        self.layer.as_slice()
+    async fn find(&self, trx: &Transaction, path: Vec<String>) -> Result<node::Node, FdbError> {
+        let mut node = node::Node {
+            subspace: self.node_subspace.to_owned(),
+            path: path.to_owned(),
+            target_path: vec![],
+            layer: None,
+            exists: false,
+            already_fetched_metadata: false,
+        };
+        for path_name in path.to_owned() {
+            let mut next_node_key = vec![DEFAULT_SUB_DIRS];
+            pack_into(&path_name, &mut next_node_key);
+            let next_node_subspace = node.subspace.subspace(&next_node_key);
+
+            match trx.get(next_node_subspace.bytes(), false).await? {
+                None => {
+                    if !path.ends_with(&[path_name]) {
+                        unimplemented!("node not found")
+                    }
+                }
+                Some(_node_name) => {
+                    node.subspace = next_node_subspace;
+                    node.path.push(path_name.to_owned());
+                }
+            }
+        }
+
+        Ok(node)
+    }
+
+    async fn get_version_value(&self, trx: &Transaction) -> FdbResult<Option<FdbSlice>> {
+        let version_subspace: &[u8] = b"version";
+        let version_key = self.node_subspace.subspace(&version_subspace);
+        trx.get(version_key.bytes(), false).await
     }
 }
-
