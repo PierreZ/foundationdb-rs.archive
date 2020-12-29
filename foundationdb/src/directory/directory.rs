@@ -142,7 +142,6 @@ impl DirectoryLayer {
             self.node_subspace.subspace(&new_node_key).bytes(),
             new_subspace.bytes(),
         );
-        println!("writing to {:?}", &new_node_key);
 
         Ok(new_subspace)
     }
@@ -219,13 +218,11 @@ impl DirectoryLayer {
 
             match trx.get(next_node_subspace.bytes(), false).await? {
                 None => {
-                    println!("found none on `{:?}`", next_node_subspace.bytes());
                     if !path.ends_with(&[path_name]) {
                         unimplemented!("node not found")
                     }
                 }
                 Some(fdb_slice) => {
-                    println!("found a node {:?}", fdb_slice.get(0));
                     node.subspace = next_node_subspace;
                     node.content_subspace = Some(Subspace::from_bytes(&*fdb_slice));
                     node.path.push(path_name.to_owned());
