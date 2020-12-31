@@ -10,6 +10,7 @@
 
 use crate::error;
 use crate::tuple::hca::HcaError;
+use crate::tuple::PackError;
 use std::io;
 
 /// The enumeration holding all possible errors from a Directory.
@@ -29,6 +30,7 @@ pub enum DirectoryError {
     IoError(io::Error),
     FdbError(error::FdbError),
     HcaError(HcaError),
+    PackError(PackError),
 }
 
 impl From<error::FdbError> for DirectoryError {
@@ -40,5 +42,11 @@ impl From<error::FdbError> for DirectoryError {
 impl From<HcaError> for DirectoryError {
     fn from(err: HcaError) -> Self {
         DirectoryError::HcaError(err)
+    }
+}
+
+impl From<PackError> for DirectoryError {
+    fn from(err: PackError) -> Self {
+        DirectoryError::PackError(err)
     }
 }

@@ -138,6 +138,20 @@ impl DirectoryLayer {
             .await
     }
 
+    /// list all sub-directory contained in the path
+    pub async fn list(
+        &self,
+        trx: &Transaction,
+        paths: Vec<String>,
+    ) -> Result<Vec<String>, DirectoryError> {
+        let nodes = self.find_nodes(trx, paths.to_owned()).await?;
+
+        match nodes.last() {
+            None => Err(DirectoryError::DirNotExists),
+            Some(node) => node.list(&trx).await,
+        }
+    }
+
     async fn create_or_open_internal(
         &self,
         trx: &Transaction,

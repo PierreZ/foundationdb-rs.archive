@@ -38,6 +38,9 @@ fn test_directory() {
     ))
     .expect("failed to run");
 
+    futures::executor::block_on(test_list(&db, &directory, vec![String::from("a")], 10))
+        .expect("failed to run");
+
     futures::executor::block_on(test_bad_layer(&db)).expect("failed to run");
 }
 
@@ -95,6 +98,41 @@ async fn test_bad_layer(db: &Database) -> Result<(), DirectoryError> {
     match result {
         Err(DirectoryError::IncompatibleLayer) => {}
         _ => panic!("should have been an IncompatibleLayer error"),
+    }
+
+    Ok(())
+}
+
+async fn test_list(
+    db: &Database,
+    directory: &DirectoryLayer,
+    paths: Vec<String>,
+    sub_path_to_create: usize,
+) -> Result<(), DirectoryError> {
+    // creating directory
+    let trx = db.create_trx()?;
+    directory.create(&trx, paths.to_owned()).await;
+    trx.commit().await.expect("could not commit");
+
+    for i in 0..sub_path_to_create {
+        let trx = db.create_trx()?;
+
+        let mut sub_path = paths.clone();
+        sub_path.push(format!("node-{}", i));
+        eprintln!("creating {:?}", sub_path.to_owned());
+        directory.create(&trx, sub_path.to_owned()).await;
+
+        trx.commit().await.expect("could not commit");
+    }
+
+    let trx = db.create_trx()?;
+
+    let sub_folders = directory.list(&trx, paths.to_owned()).await?;
+    eprintln!("found {:?}", sub_folders);
+    assert_eq!(sub_folders.len(), sub_path_to_create);
+
+    for i in 0..sub_path_to_create {
+        assert!(sub_folders.contains(&format!("node-{}", i)));
     }
 
     Ok(())
