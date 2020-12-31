@@ -148,8 +148,8 @@ impl DirectoryLayer {
     ) -> Result<Subspace, DirectoryError> {
         self.check_version(trx, allow_create).await?;
 
-        if prefix.len() > 0 && !self.allow_manual_prefixes {
-            if self.path.len() == 0 {
+        if !prefix.is_empty() && !self.allow_manual_prefixes {
+            if self.path.is_empty() {
                 return Err(DirectoryError::Message(
                     "cannot specify a prefix unless manual prefixes are enabled".to_string(),
                 ));
@@ -160,7 +160,7 @@ impl DirectoryLayer {
             ));
         }
 
-        if paths.len() == 0 {
+        if paths.is_empty() {
             return Err(DirectoryError::NoPathProvided);
         }
 
@@ -177,7 +177,7 @@ impl DirectoryLayer {
                 return Err(DirectoryError::DirAlreadyExists);
             }
 
-            if self.layer.len() > 0 {
+            if !self.layer.is_empty() {
                 node.check_layer(self.layer.to_owned())?;
             }
 
@@ -282,12 +282,10 @@ impl DirectoryLayer {
 
             node.retrieve_layer(&trx).await?;
 
-            match trx.get(node.node_subspace.bytes(), false).await? {
-                Some(fdb_slice) => {
-                    node.content_subspace = Some(Subspace::from_bytes(&*fdb_slice));
-                }
-                _ => {} // noop in case of a none existing node
+            if let Some(fdb_slice) = trx.get(node.node_subspace.bytes(), false).await? {
+                node.content_subspace = Some(Subspace::from_bytes(&*fdb_slice));
             }
+
             nodes.push(node);
         }
 

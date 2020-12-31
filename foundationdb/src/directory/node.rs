@@ -49,7 +49,7 @@ impl Node {
 
         self.content_subspace = Some(new_subspace.to_owned());
 
-        Ok(new_subspace.clone())
+        Ok(new_subspace)
     }
 
     /// retrieve the layer used for this node
