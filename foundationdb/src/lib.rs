@@ -100,7 +100,7 @@ pub mod api;
 #[cfg(any(feature = "fdb-5_1", feature = "fdb-5_2", feature = "fdb-6_0"))]
 pub mod cluster;
 mod database;
-mod directory;
+pub mod directory;
 mod error;
 pub mod future;
 mod keyselector;
@@ -114,7 +114,6 @@ pub mod tuple;
 pub use crate::cluster::Cluster;
 
 pub use crate::database::*;
-pub use crate::directory::*;
 pub use crate::error::FdbError;
 pub use crate::error::FdbResult;
 pub use crate::keyselector::*;

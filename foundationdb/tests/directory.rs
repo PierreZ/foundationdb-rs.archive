@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use foundationdb::directory::DirectoryLayer;
 use foundationdb::*;
 
 mod common;
@@ -16,7 +17,7 @@ async fn test_create_then_open_async(
 ) -> FdbResult<()> {
     eprintln!("creating directory for {:?}", paths.to_owned());
     let trx = db.create_trx()?;
-    let create_output = directory.create(&trx, paths.to_owned()).await;
+    let create_output = directory.create_or_open(&trx, paths.to_owned()).await;
     assert!(create_output.is_ok());
 
     trx.commit().await?;
