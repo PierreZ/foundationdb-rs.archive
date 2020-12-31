@@ -117,13 +117,13 @@ impl DirectoryLayer {
         txn: &Transaction,
         paths: Vec<String>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, paths, vec![], vec![], true, true)
+        self.create_or_open_internal(txn, paths, vec![], true, true)
             .await
     }
 
     /// Creates a directory located at path (creating parent directories if necessary).
     pub async fn create(&self, txn: &Transaction, paths: Vec<String>) -> Option<DirectoryError> {
-        self.create_or_open_internal(txn, paths, vec![], vec![], true, false)
+        self.create_or_open_internal(txn, paths, vec![], true, false)
             .await
             .err()
     }
@@ -134,7 +134,7 @@ impl DirectoryLayer {
         txn: &Transaction,
         paths: Vec<String>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, paths, vec![], vec![], false, true)
+        self.create_or_open_internal(txn, paths, vec![], false, true)
             .await
     }
 
@@ -143,7 +143,6 @@ impl DirectoryLayer {
         trx: &Transaction,
         paths: Vec<String>,
         prefix: Vec<u8>,
-        layer: Vec<u8>,
         allow_create: bool,
         allow_open: bool,
     ) -> Result<Subspace, DirectoryError> {
@@ -178,8 +177,8 @@ impl DirectoryLayer {
                 return Err(DirectoryError::DirAlreadyExists);
             }
 
-            if layer.len() > 0 {
-                node.check_layer(layer)?;
+            if self.layer.len() > 0 {
+                node.check_layer(self.layer.to_owned())?;
             }
 
             return Ok(node.content_subspace.clone().unwrap());

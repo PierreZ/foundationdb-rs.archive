@@ -5,10 +5,41 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use foundationdb::directory::error::DirectoryError;
 use foundationdb::directory::DirectoryLayer;
 use foundationdb::*;
 
 mod common;
+
+#[test]
+fn test_directory() {
+    let _guard = unsafe { foundationdb::boot() };
+    let db = futures::executor::block_on(common::database()).expect("cannot open fdb");
+
+    eprintln!("clearing all keys");
+    let trx = db.create_trx().expect("cannot create txn");
+    trx.clear_range(b"\x00", b"\xff");
+    futures::executor::block_on(trx.commit()).expect("could not clear keys");
+
+    eprintln!("creating directories");
+    let directory = DirectoryLayer::default();
+
+    futures::executor::block_on(test_create_or_open_async(
+        &db,
+        &directory,
+        vec![String::from("a")],
+    ))
+    .expect("failed to run");
+
+    futures::executor::block_on(test_create_then_open_async(
+        &db,
+        &directory,
+        vec![String::from("b"), String::from("a")],
+    ))
+    .expect("failed to run");
+
+    futures::executor::block_on(test_bad_layer(&db)).expect("failed to run");
+}
 
 async fn test_create_then_open_async(
     db: &Database,
@@ -42,30 +73,29 @@ async fn test_create_or_open_async(
     Ok(())
 }
 
-#[test]
-fn test_directory() {
-    let _guard = unsafe { foundationdb::boot() };
-    let db = futures::executor::block_on(common::database()).expect("cannot open fdb");
+async fn test_bad_layer(db: &Database) -> Result<(), DirectoryError> {
+    let directory = DirectoryLayer {
+        layer: vec![0u8],
+        ..Default::default()
+    };
+    let trx = db.create_trx()?;
 
-    eprintln!("clearing all keys");
-    let trx = db.create_trx().expect("cannot create txn");
-    trx.clear_range(b"\x00", b"\xff");
-    futures::executor::block_on(trx.commit()).expect("could not clear keys");
+    directory
+        .create_or_open(&trx, vec![String::from("bad_layer")])
+        .await?;
 
-    eprintln!("creating directories");
-    let directory = DirectoryLayer::default();
+    let directory = DirectoryLayer {
+        layer: vec![1u8],
+        ..Default::default()
+    };
 
-    futures::executor::block_on(test_create_or_open_async(
-        &db,
-        &directory,
-        vec![String::from("a")],
-    ))
-    .expect("failed to run");
+    let result = directory
+        .create_or_open(&trx, vec![String::from("bad_layer")])
+        .await;
+    match result {
+        Err(DirectoryError::IncompatibleLayer) => {}
+        _ => panic!("should have been an IncompatibleLayer error"),
+    }
 
-    futures::executor::block_on(test_create_then_open_async(
-        &db,
-        &directory,
-        vec![String::from("b"), String::from("a")],
-    ))
-    .expect("failed to run");
+    Ok(())
 }
