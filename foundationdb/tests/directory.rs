@@ -132,7 +132,15 @@ async fn test_list(
     assert_eq!(sub_folders.len(), sub_path_to_create);
 
     for i in 0..sub_path_to_create {
+        let mut sub_path = paths.clone();
+        sub_path.push(format!("node-{}", i));
         assert!(sub_folders.contains(&format!("node-{}", i)));
+
+        let trx = db.create_trx()?;
+        match directory.exists(&trx, sub_path.to_owned()).await {
+            Ok(_) => {}
+            Err(err) => panic!("should have found {:?}: {:?}", sub_path, err),
+        }
     }
 
     Ok(())

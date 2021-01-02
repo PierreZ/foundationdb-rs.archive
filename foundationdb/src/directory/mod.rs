@@ -111,7 +111,10 @@ impl Default for DirectoryLayer {
 }
 
 impl DirectoryLayer {
-    /// Creates or opens the directory located at path(creating parent directories, if necessary).
+    /// CreateOrOpen opens the directory specified by path (relative to this
+    /// Directory), and returns the directory and its contents as a
+    /// Subspace. If the directory does not exist, it is created
+    /// (creating parent directories if necessary).
     pub async fn create_or_open(
         &self,
         txn: &Transaction,
@@ -121,14 +124,19 @@ impl DirectoryLayer {
             .await
     }
 
-    /// Creates a directory located at path (creating parent directories if necessary).
+    /// Create creates a directory specified by path (relative to this
+    /// Directory), and returns the directory and its contents as a
+    /// Subspace (or ErrDirAlreadyExists if the directory already exists).
     pub async fn create(&self, txn: &Transaction, paths: Vec<String>) -> Option<DirectoryError> {
         self.create_or_open_internal(txn, paths, vec![], true, false)
             .await
             .err()
     }
 
-    /// Opens the directory located at path.
+    /// Open opens the directory specified by path (relative to this Directory),
+    /// and returns the directory and its contents as a Subspace (or Err(DirNotExists)
+    /// error if the directory does not exist, or ErrParentDirDoesNotExist if one of the parent
+    /// directories in the path does not exist).
     pub async fn open(
         &self,
         txn: &Transaction,
@@ -138,7 +146,46 @@ impl DirectoryLayer {
             .await
     }
 
-    /// list all sub-directory contained in the path
+    /// Exists returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
+    pub async fn exists(
+        &self,
+        trx: &Transaction,
+        paths: Vec<String>,
+    ) -> Result<bool, DirectoryError> {
+        let nodes = self.find_nodes(trx, paths.to_owned()).await?;
+
+        match nodes.last() {
+            None => Err(DirectoryError::DirNotExists),
+            Some(_) => Ok(true),
+        }
+    }
+
+    /// Move moves the directory at oldPath to newPath (both relative to this
+    /// Directory), and returns the directory (at its new location) and its
+    /// contents as a Subspace. Move will return an error if a directory
+    /// does not exist at oldPath, a directory already exists at newPath, or the
+    /// parent directory of newPath does not exist.
+    pub async fn move_to(
+        &self,
+        trx: &Transaction,
+        old_path: Vec<String>,
+        new_path: Vec<String>,
+    ) -> Result<bool, DirectoryError> {
+        unimplemented!("move is not supported yet")
+    }
+
+    /// Exists returns true if the directory at path (relative to this Directory)
+    /// exists, and false otherwise.
+    pub async fn remove(
+        &self,
+        trx: &Transaction,
+        path: Vec<String>,
+    ) -> Result<bool, DirectoryError> {
+        unimplemented!("move is not supported yet")
+    }
+
+    /// List returns the names of the immediate subdirectories of the default root directory as a slice of strings.
+    /// Each string is the name of the last component of a subdirectory's path.  
     pub async fn list(
         &self,
         trx: &Transaction,
