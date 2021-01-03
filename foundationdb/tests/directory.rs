@@ -41,6 +41,13 @@ fn test_directory() {
     futures::executor::block_on(test_list(&db, &directory, vec![String::from("a")], 10))
         .expect("failed to run");
 
+    futures::executor::block_on(test_children_content_subspace(
+        &db,
+        &directory,
+        vec![String::from("c")],
+    ))
+    .expect("failed to run");
+
     futures::executor::block_on(test_bad_layer(&db)).expect("failed to run");
 }
 
@@ -76,6 +83,7 @@ async fn test_create_or_open_async(
     Ok(())
 }
 
+/// testing that we throwing Err(DirectoryError::IncompatibleLayer)
 async fn test_bad_layer(db: &Database) -> Result<(), DirectoryError> {
     let directory = DirectoryLayer {
         layer: vec![0u8],
@@ -103,6 +111,7 @@ async fn test_bad_layer(db: &Database) -> Result<(), DirectoryError> {
     Ok(())
 }
 
+/// testing list functionality. Will open paths and create n sub-folders.
 async fn test_list(
     db: &Database,
     directory: &DirectoryLayer,
@@ -142,6 +151,43 @@ async fn test_list(
             Err(err) => panic!("should have found {:?}: {:?}", sub_path, err),
         }
     }
+
+    Ok(())
+}
+
+/// checks that the content_subspace of the children is inside the parent
+async fn test_children_content_subspace(
+    db: &Database,
+    directory: &DirectoryLayer,
+    paths: Vec<String>,
+) -> Result<(), DirectoryError> {
+    let trx = db.create_trx()?;
+
+    eprintln!("parent = {:?}", paths.to_owned());
+
+    let root_subspace = directory.create_or_open(&trx, paths.to_owned()).await?;
+
+    let mut children_path = paths.clone();
+    children_path.push(String::from("nested"));
+    eprintln!("children = {:?}", children_path.to_owned());
+
+    let children_subspace = directory
+        .create_or_open(&trx, children_path.to_owned())
+        .await?;
+
+    assert!(
+        children_subspace.bytes().starts_with(root_subspace.bytes()),
+        "children subspace '{:?} does not start with parent subspace '{:?}'",
+        children_subspace.bytes(),
+        root_subspace.bytes()
+    );
+
+    trx.commit().await.expect("could not commit");
+    let trx = db.create_trx()?;
+
+    let open_children_subspace = directory.open(&trx, children_path.to_owned()).await?;
+
+    assert_eq!(children_subspace.bytes(), open_children_subspace.bytes());
 
     Ok(())
 }

@@ -167,9 +167,9 @@ impl DirectoryLayer {
     /// parent directory of newPath does not exist.
     pub async fn move_to(
         &self,
-        trx: &Transaction,
-        old_path: Vec<String>,
-        new_path: Vec<String>,
+        _trx: &Transaction,
+        _old_path: Vec<String>,
+        _new_path: Vec<String>,
     ) -> Result<bool, DirectoryError> {
         unimplemented!("move is not supported yet")
     }
@@ -178,8 +178,8 @@ impl DirectoryLayer {
     /// exists, and false otherwise.
     pub async fn remove(
         &self,
-        trx: &Transaction,
-        path: Vec<String>,
+        _trx: &Transaction,
+        _path: Vec<String>,
     ) -> Result<bool, DirectoryError> {
         unimplemented!("move is not supported yet")
     }
@@ -250,13 +250,21 @@ impl DirectoryLayer {
             return Err(DirectoryError::DirNotExists);
         }
 
-        let mut subspace = self.content_subspace.clone();
+        let mut parent_subspace = self.content_subspace.clone();
 
         for mut node in nodes {
-            let allocator = self.allocator.allocate(trx).await?;
-            subspace = node.create_subspace(&trx, allocator, &subspace).await?;
+            match node.content_subspace {
+                None => {
+                    // creating subspace
+                    let allocator = self.allocator.allocate(trx).await?;
+                    parent_subspace = node
+                        .create_subspace(&trx, allocator, &parent_subspace)
+                        .await?;
+                }
+                Some(subspace) => parent_subspace = subspace.clone(),
+            }
         }
-        Ok(subspace)
+        Ok(parent_subspace)
     }
 
     /// checks the version of the directory within FDB
@@ -330,12 +338,16 @@ impl DirectoryLayer {
 
         let mut subspace = self.node_subspace.to_owned();
 
+        let mut node_path = vec![];
+
         for path_name in paths {
+            node_path.push(path_name.to_owned());
             let mut next_node_key = vec![DEFAULT_SUB_DIRS];
             pack_into(&path_name, &mut next_node_key);
             subspace = subspace.subspace(&next_node_key);
 
             let mut node = Node {
+                paths: node_path.clone(),
                 layer: None,
                 node_subspace: subspace.to_owned(),
                 content_subspace: None,
