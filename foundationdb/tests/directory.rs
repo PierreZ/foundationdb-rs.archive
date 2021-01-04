@@ -49,6 +49,46 @@ fn test_directory() {
     .expect("failed to run");
 
     futures::executor::block_on(test_bad_layer(&db)).expect("failed to run");
+
+    futures::executor::block_on(test_move_to(
+        &db,
+        &directory,
+        vec![String::from("d"), String::from("e")],
+        vec![String::from("a"), String::from("g")],
+    ))
+    .expect("failed to run");
+}
+
+async fn test_move_to(
+    db: &Database,
+    directory: &DirectoryLayer,
+    old_paths: Vec<String>,
+    new_paths: Vec<String>,
+) -> Result<(), DirectoryError> {
+    let trx = db.create_trx()?;
+    let create_output = directory.create_or_open(&trx, old_paths.to_owned()).await?;
+
+    trx.commit().await.expect("could not commit");
+    let trx = db.create_trx()?;
+
+    let move_output = directory
+        .move_to(&trx, old_paths.to_owned(), new_paths.to_owned())
+        .await?;
+    assert!(move_output);
+
+    trx.commit().await.expect("could not commit");
+    let trx = db.create_trx()?;
+
+    let open_output = directory.open(&trx, new_paths).await?;
+    assert_eq!(create_output.bytes(), open_output.bytes());
+
+    trx.commit().await.expect("could not commit");
+    let trx = db.create_trx()?;
+
+    let open_old_path = directory.open(&trx, old_paths).await;
+    assert!(open_old_path.is_err());
+
+    Ok(())
 }
 
 async fn test_create_then_open_async(

@@ -38,22 +38,38 @@ impl Node {
 
     /// This will use the generated id and:
     ///
-    /// * persist the node in the directory subspace dedicated to nodes
+    /// * persist the node in the directory subspace
     /// * create the content_subspace and returns it
-    pub(crate) async fn create_subspace(
+    pub(crate) async fn create_and_write_content_subspace(
         &mut self,
         trx: &Transaction,
         generated_id: i64,
         parent_subspace: &Subspace,
     ) -> Result<Subspace, DirectoryError> {
-        let new_subspace = parent_subspace.subspace(&generated_id);
+        let subspace = parent_subspace.subspace(&generated_id);
+        self.persist_content_subspace(&trx, subspace).await
+    }
 
+    /// `persist_content_subspace` will save the provided subspace as the `content_subspace`
+    pub(crate) async fn persist_content_subspace(
+        &mut self,
+        trx: &Transaction,
+        subspace: Subspace,
+    ) -> Result<Subspace, DirectoryError> {
         let key = self.node_subspace.to_owned();
-        trx.set(key.bytes(), new_subspace.bytes());
+        trx.set(key.bytes(), subspace.bytes());
+        self.content_subspace = Some(subspace.to_owned());
+        Ok(subspace)
+    }
 
-        self.content_subspace = Some(new_subspace.to_owned());
-
-        Ok(new_subspace)
+    /// delete subspace from the node_subspace
+    pub(crate) async fn delete_content_subspace(
+        &mut self,
+        trx: &Transaction,
+    ) -> Result<(), DirectoryError> {
+        let key = self.node_subspace.to_owned();
+        trx.clear(key.bytes());
+        Ok(())
     }
 
     /// retrieve the layer used for this node

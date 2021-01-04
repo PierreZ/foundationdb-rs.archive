@@ -22,6 +22,8 @@ pub enum DirectoryError {
     DirAlreadyExists,
     /// missing path.
     DirNotExists,
+    /// Parent does not exists
+    ParentDirDoesNotExists,
     /// the layer is incompatible.
     IncompatibleLayer,
     Message(String),

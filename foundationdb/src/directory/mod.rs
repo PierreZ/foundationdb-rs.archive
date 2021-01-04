@@ -167,11 +167,47 @@ impl DirectoryLayer {
     /// parent directory of newPath does not exist.
     pub async fn move_to(
         &self,
-        _trx: &Transaction,
-        _old_path: Vec<String>,
-        _new_path: Vec<String>,
+        trx: &Transaction,
+        old_path: Vec<String>,
+        new_path: Vec<String>,
     ) -> Result<bool, DirectoryError> {
-        unimplemented!("move is not supported yet")
+        self.check_version(trx, false).await?;
+
+        let mut old_nodes = self.find_nodes(&trx, old_path.to_owned()).await?;
+        let last_node_from_old_path = match old_nodes.last_mut() {
+            None => return Err(DirectoryError::Message(String::from("empty path"))),
+            Some(node) => node,
+        };
+        let content_subspace = last_node_from_old_path
+            .content_subspace
+            .as_ref()
+            .ok_or(DirectoryError::DirNotExists)?;
+
+        let mut new_nodes = self.find_nodes(&trx, new_path.to_owned()).await?;
+        // assert that parent of the new node exists
+        if new_nodes.get(new_nodes.len() - 2).is_none() {
+            return Err(DirectoryError::ParentDirDoesNotExists);
+        }
+
+        let last_node_from_new_path = match new_nodes.last_mut() {
+            None => return Err(DirectoryError::Message(String::from("empty path"))),
+            Some(node) => {
+                if node.content_subspace.is_some() {
+                    return Err(DirectoryError::DirNotExists);
+                }
+                node
+            }
+        };
+
+        last_node_from_new_path
+            .persist_content_subspace(&trx, content_subspace.to_owned())
+            .await?;
+
+        last_node_from_old_path
+            .delete_content_subspace(&trx)
+            .await?;
+
+        Ok(true)
     }
 
     /// Exists returns true if the directory at path (relative to this Directory)
@@ -258,7 +294,7 @@ impl DirectoryLayer {
                     // creating subspace
                     let allocator = self.allocator.allocate(trx).await?;
                     parent_subspace = node
-                        .create_subspace(&trx, allocator, &parent_subspace)
+                        .create_and_write_content_subspace(&trx, allocator, &parent_subspace)
                         .await?;
                 }
                 Some(subspace) => parent_subspace = subspace.clone(),
