@@ -12,7 +12,7 @@ use foundationdb::*;
 mod common;
 
 #[test]
-fn test_directory() {
+fn test_create_or_open_directory() {
     let _guard = unsafe { foundationdb::boot() };
     let db = futures::executor::block_on(common::database()).expect("cannot open fdb");
 
@@ -50,11 +50,51 @@ fn test_directory() {
 
     futures::executor::block_on(test_bad_layer(&db)).expect("failed to run");
 
+    // testing deletes
+
+    eprintln!("clearing all keys");
+    let trx = db.create_trx().expect("cannot create txn");
+    trx.clear_range(b"", b"\xff");
+    futures::executor::block_on(trx.commit()).expect("could not clear keys");
+
+    eprintln!("creating directories");
+    let directory = DirectoryLayer::default();
+
+    // test deletions, first we need to create it
+    futures::executor::block_on(test_create_or_open_async(
+        &db,
+        &directory,
+        vec![String::from("deletion")],
+    ))
+    .expect("failed to run");
+    // then delete it
+    futures::executor::block_on(test_delete_async(
+        &db,
+        &directory,
+        vec![String::from("deletion")],
+    ))
+    .expect("failed to run");
+
+    futures::executor::block_on(test_create_then_delete(
+        &db,
+        &directory,
+        vec![String::from("n0")],
+        1,
+    ))
+    .expect("failed to run");
+
+    // moves
+
+    eprintln!("clearing all keys");
+    let trx = db.create_trx().expect("cannot create txn");
+    trx.clear_range(b"", b"\xff");
+    futures::executor::block_on(trx.commit()).expect("could not clear keys");
+
     futures::executor::block_on(test_create_then_move_to(
         &db,
         &directory,
         vec![String::from("d"), String::from("e")],
-        vec![String::from("a"), String::from("g")],
+        vec![String::from("a")],
     ))
     .expect("failed to run");
 
@@ -128,6 +168,68 @@ fn test_directory() {
         Err(err) => panic!("should have BadDestinationDirectory, got {:?}", err),
         Ok(()) => panic!("should not be fine"),
     }
+}
+
+async fn test_create_then_delete(
+    db: &Database,
+    directory: &DirectoryLayer,
+    paths: Vec<String>,
+    sub_path_to_create: usize,
+) -> Result<(), DirectoryError> {
+    // creating directory
+    let trx = db.create_trx()?;
+    directory.create_or_open(&trx, paths.to_owned()).await?;
+
+    trx.commit().await.expect("could not commit");
+
+    let trx = db.create_trx()?;
+    let children = directory.list(&trx, paths.to_owned()).await?;
+    assert!(children.is_empty());
+    trx.commit().await.expect("could not commit");
+
+    for i in 0..sub_path_to_create {
+        let trx = db.create_trx()?;
+        let mut sub_path = paths.clone();
+        let path_name = format!("{}", i);
+        sub_path.push(path_name.to_owned());
+
+        // creating subfolders
+        eprintln!("creating {:?}", sub_path.to_owned());
+        directory.create(&trx, sub_path.to_owned()).await;
+        trx.commit().await.expect("could not commit");
+
+        // checking it does exists
+        let trx = db.create_trx()?;
+        eprintln!("trying to get {:?}", sub_path.to_owned());
+        let exists = directory.exists(&trx, sub_path.to_owned()).await?;
+        assert!(exists, "path {:?} should exists", sub_path.to_owned());
+        trx.commit().await.expect("could not commit");
+
+        let trx = db.create_trx()?;
+        let children = directory.list(&trx, paths.to_owned()).await?;
+        assert!(children.contains(&path_name.to_owned()));
+        trx.commit().await.expect("could not commit");
+
+        // trying to delete it
+        let trx = db.create_trx()?;
+        eprintln!("deleting {:?}", sub_path.to_owned());
+        let delete_result = directory.remove(&trx, sub_path.to_owned()).await?;
+        assert!(delete_result);
+        trx.commit().await.expect("could not commit");
+
+        // checking it does not exists
+        let trx = db.create_trx()?;
+        eprintln!("trying to get {:?}", sub_path.to_owned());
+        let exists = directory.exists(&trx, sub_path.to_owned()).await?;
+        assert!(!exists, "path {:?} should not exists", sub_path.to_owned());
+        trx.commit().await.expect("could not commit");
+    }
+    let trx = db.create_trx()?;
+    let children = directory.list(&trx, paths.to_owned()).await?;
+    assert!(children.is_empty(), "children is not empty: {:?}", children);
+    trx.commit().await.expect("could not commit");
+
+    Ok(())
 }
 
 async fn test_create_then_move_to(
@@ -228,6 +330,30 @@ async fn test_create_or_open_async(
     let trx = db.create_trx()?;
     let create_output = directory.create_or_open(&trx, paths.to_owned()).await;
     assert!(create_output.is_ok());
+    Ok(())
+}
+
+async fn test_delete_async(
+    db: &Database,
+    directory: &DirectoryLayer,
+    paths: Vec<String>,
+) -> FdbResult<()> {
+    let trx = db.create_trx()?;
+    let _ = directory
+        .create_or_open(&trx, paths.to_owned())
+        .await
+        .expect("cannot create");
+    eprintln!("removing {:?}", paths.to_owned());
+    let delete_output = directory.remove(&trx, paths.to_owned()).await;
+    assert!(delete_output.is_ok());
+    trx.commit().await.expect("could not commit");
+
+    // checking it does not exists
+    let trx = db.create_trx()?;
+    let exists = directory.exists(&trx, paths.to_owned()).await.expect("bla");
+    assert!(!exists, "path {:?} should not exists", paths.to_owned());
+    trx.commit().await.expect("could not commit");
+
     Ok(())
 }
 

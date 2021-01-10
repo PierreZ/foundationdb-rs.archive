@@ -153,10 +153,9 @@ impl DirectoryLayer {
         paths: Vec<String>,
     ) -> Result<bool, DirectoryError> {
         let nodes = self.find_nodes(trx, paths.to_owned()).await?;
-
         match nodes.last() {
-            None => Err(DirectoryError::DirNotExists),
-            Some(_) => Ok(true),
+            None => Ok(false),
+            Some(node) => Ok(node.content_subspace.is_some()),
         }
     }
 
@@ -220,20 +219,35 @@ impl DirectoryLayer {
             .await?;
 
         last_node_from_old_path
-            .delete_content_subspace(&trx)
+            .delete_content_from_node_subspace(&trx)
             .await?;
 
         Ok(true)
     }
 
-    /// Exists returns true if the directory at path (relative to this Directory)
-    /// exists, and false otherwise.
+    /// `Remove` the subdirectory of this Directory located at `path` and all of its subdirectories,
+    /// as well as all of their contents.
     pub async fn remove(
         &self,
-        _trx: &Transaction,
-        _path: Vec<String>,
+        trx: &Transaction,
+        path: Vec<String>,
     ) -> Result<bool, DirectoryError> {
-        unimplemented!("move is not supported yet")
+        self.check_version(trx, false).await?;
+        if path.is_empty() {
+            return Err(DirectoryError::NoPathProvided);
+        }
+
+        let nodes = self.find_nodes(&trx, path.to_owned()).await?;
+
+        match nodes.last() {
+            None => Ok(false),
+            Some(node) => {
+                println!("found a node to delete: {:?}", node);
+                node.delete_content_from_node_subspace(&trx).await?;
+                node.delete_content_from_content_subspace(&trx).await?;
+                Ok(true)
+            }
+        }
     }
 
     /// List returns the names of the immediate subdirectories of the default root directory as a slice of strings.
@@ -409,6 +423,7 @@ impl DirectoryLayer {
             node.retrieve_layer(&trx).await?;
 
             if let Some(fdb_slice) = trx.get(node.node_subspace.bytes(), false).await? {
+                println!("found something in {:?}", node.node_subspace.to_owned());
                 node.content_subspace = Some(Subspace::from_bytes(&*fdb_slice));
             }
 

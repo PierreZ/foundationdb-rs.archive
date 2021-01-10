@@ -63,13 +63,34 @@ impl Node {
     }
 
     /// delete subspace from the node_subspace
-    pub(crate) async fn delete_content_subspace(
-        &mut self,
+    pub(crate) async fn delete_content_from_node_subspace(
+        &self,
         trx: &Transaction,
     ) -> Result<(), DirectoryError> {
-        let key = self.node_subspace.to_owned();
-        trx.clear(key.bytes());
+        println!(
+            "deleting node_subspace {:?}",
+            &self.node_subspace.to_owned()
+        );
+        trx.clear(&self.node_subspace.bytes());
+        //trx.clear_subspace_range(&self.node_subspace.to_owned());
         Ok(())
+    }
+
+    pub(crate) async fn delete_content_from_content_subspace(
+        &self,
+        trx: &Transaction,
+    ) -> Result<(), DirectoryError> {
+        match self.content_subspace.to_owned() {
+            None => Ok(()),
+            Some(subspace) => {
+                println!(
+                    "deleting content_subspace {:?}",
+                    &self.content_subspace.to_owned()
+                );
+                trx.clear_subspace_range(&subspace);
+                Ok(())
+            }
+        }
     }
 
     /// retrieve the layer used for this node
