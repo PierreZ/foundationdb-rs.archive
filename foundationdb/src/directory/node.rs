@@ -96,24 +96,8 @@ impl Node {
         for fdb_value in fdb_values {
             let subspace = Subspace::from_bytes(fdb_value.key());
             // stripping from subspace
-            let sub_directory: Vec<u8> = self.node_subspace.unpack(subspace.bytes())?;
-            match String::from_utf8(sub_directory.to_owned()) {
-                Ok(mut s) => {
-                    // s is like "\u{0}\u{2}node-0\u{0}"
-                    // we need to remove DEFAULT_SUB_DIRS at the beginning and the padding at the end.
-                    // maybe there is a better way to clean it? Unpack?
-                    s.remove(0);
-                    s.remove(0);
-                    s.remove(s.len() - 1);
-                    results.push(s);
-                }
-                Err(err) => {
-                    return Err(DirectoryError::Message(format!(
-                        "could not decode '{:?}' in utf-8: {}",
-                        sub_directory, err
-                    )))
-                }
-            }
+            let sub_directory: (Vec<u8>, String) = self.node_subspace.unpack(subspace.bytes())?;
+            results.push(sub_directory.1);
         }
         Ok(results)
     }

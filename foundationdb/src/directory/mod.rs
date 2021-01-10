@@ -18,7 +18,7 @@ use crate::directory::error::DirectoryError;
 use crate::directory::node::Node;
 use crate::future::FdbSlice;
 use crate::tuple::hca::HighContentionAllocator;
-use crate::tuple::{pack_into, Subspace};
+use crate::tuple::Subspace;
 use crate::{FdbError, FdbResult, Transaction};
 use byteorder::{LittleEndian, WriteBytesExt};
 
@@ -378,9 +378,10 @@ impl DirectoryLayer {
 
         for path_name in paths {
             node_path.push(path_name.to_owned());
-            let mut next_node_key = vec![DEFAULT_SUB_DIRS];
-            pack_into(&path_name, &mut next_node_key);
-            subspace = subspace.subspace(&next_node_key);
+            subspace = subspace.subspace::<(&[u8], String)>(&(
+                vec![DEFAULT_SUB_DIRS].as_slice(),
+                path_name.to_owned(),
+            ));
 
             let mut node = Node {
                 paths: node_path.clone(),
