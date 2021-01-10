@@ -22,6 +22,7 @@ use crate::tuple::Subspace;
 use crate::{FdbError, FdbResult, Transaction};
 use byteorder::{LittleEndian, WriteBytesExt};
 
+// TODO: useful?
 const _LAYER_VERSION: (u8, u8, u8) = (1, 0, 0);
 const MAJOR_VERSION: u32 = 1;
 const MINOR_VERSION: u32 = 0;
@@ -73,19 +74,58 @@ const DEFAULT_SUB_DIRS: u8 = 0;
 /// futures::executor::block_on(async_main()).expect("failed to run");
 /// drop(network);
 /// ```
+/// ## How it works
+///
+/// Here's what will be generated when using the Directory to create a path `/app/my-app`:
+///
+/// ```text
+///                +
+///                |
+///                | version = (1,0,0)              # Directory's version
+///                |
+///                |      +
+///                | "hca"|                          # used to allocate numbers like 12 and 42
+///                |      +
+///      \xFE      |
+///     node's     | (0,"app")=12                    # id allocated by the hca for "path"
+///    subspace    | (0,"app","layer")=""            # layer allow an ownership's mecanism
+///                |
+///                |
+///                | (0,"app",0,"my-app","layer")="" # layer allow an ownership's mecanism
+///                | (0,"app",0,"my-app")=42         # id allocated by the hca for "layer"
+///                +
+//
+///
+///                +
+///                |
+///                |
+///    (12,42)     |
+///    content     | # data's subspace for path "app","my-app"
+///   subspace     |
+///                |
+///                +
+/// ```
+/// In this schema:
+///
+/// * vertical lines represents `Subspaces`,
+/// * `()` `Tuples`,
+/// * `#` comments.
+///
 pub struct DirectoryLayer {
-    /// the subspace used to store nodes.
+    /// the subspace used to store the hierarchy of paths. Each path is composed of Nodes.
+    /// Default is `Subspace::all()`.
     pub node_subspace: Subspace,
     /// the subspace used to actually store the data.
+    /// Default is `Subspace::from_bytes(b"\xFE")`
     pub content_subspace: Subspace,
 
-    /// The allocator used to generates i64 paths to shorten keys
+    /// The allocator used to generates i64 paths that will reduce keys's length.
+    /// Default HAC is using  `Subspace::from_bytes(b"hca")` as the subspace.
     pub allocator: HighContentionAllocator,
 
     pub allow_manual_prefixes: bool,
 
     pub path: Vec<String>,
-
     /// This is set at node creation time and never mutated by the directory layer.
     /// If a layer is provided when opening nodes it checks to see that the layer matches nodes that are read.
     /// When there's a mismatch an error is thrown.
@@ -104,62 +144,62 @@ impl Default for DirectoryLayer {
                 Subspace::from_bytes(DEFAULT_NODE_PREFIX).subspace(&DEFAULT_HCA_PREFIX),
             ),
             allow_manual_prefixes: false,
-            path: vec![],
             layer: vec![],
+            path: vec![],
         }
     }
 }
 
 impl DirectoryLayer {
-    /// CreateOrOpen opens the directory specified by path (relative to this
+    /// `CreateOrOpen` opens the directory specified by path (relative to this
     /// Directory), and returns the directory and its contents as a
     /// Subspace. If the directory does not exist, it is created
     /// (creating parent directories if necessary).
     pub async fn create_or_open(
         &self,
         txn: &Transaction,
-        paths: Vec<String>,
+        path: Vec<String>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, paths, vec![], true, true)
+        self.create_or_open_internal(txn, path, vec![], true, true)
             .await
     }
 
-    /// Create creates a directory specified by path (relative to this
+    /// `Create` creates a directory specified by path (relative to this
     /// Directory), and returns the directory and its contents as a
     /// Subspace (or ErrDirAlreadyExists if the directory already exists).
-    pub async fn create(&self, txn: &Transaction, paths: Vec<String>) -> Option<DirectoryError> {
-        self.create_or_open_internal(txn, paths, vec![], true, false)
+    pub async fn create(&self, txn: &Transaction, path: Vec<String>) -> Option<DirectoryError> {
+        self.create_or_open_internal(txn, path, vec![], true, false)
             .await
             .err()
     }
 
-    /// Open opens the directory specified by path (relative to this Directory),
+    /// `Open` opens the directory specified by path (relative to this Directory),
     /// and returns the directory and its contents as a Subspace (or Err(DirNotExists)
     /// error if the directory does not exist, or ErrParentDirDoesNotExist if one of the parent
     /// directories in the path does not exist).
     pub async fn open(
         &self,
         txn: &Transaction,
-        paths: Vec<String>,
+        path: Vec<String>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, paths, vec![], false, true)
+        self.create_or_open_internal(txn, path, vec![], false, true)
             .await
     }
 
-    /// Exists returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
+    /// `Exists` returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
     pub async fn exists(
         &self,
         trx: &Transaction,
-        paths: Vec<String>,
+        path: Vec<String>,
     ) -> Result<bool, DirectoryError> {
-        let nodes = self.find_nodes(trx, paths.to_owned()).await?;
+        let nodes = self.find_nodes(trx, path.to_owned()).await?;
         match nodes.last() {
             None => Ok(false),
             Some(node) => Ok(node.content_subspace.is_some()),
         }
     }
 
-    /// Move moves the directory at oldPath to newPath (both relative to this
+    /// `Move moves` the directory from old_path to new_path(both relative to this
     /// Directory), and returns the directory (at its new location) and its
     /// contents as a Subspace. Move will return an error if a directory
     /// does not exist at oldPath, a directory already exists at newPath, or the
@@ -169,7 +209,7 @@ impl DirectoryLayer {
         trx: &Transaction,
         old_path: Vec<String>,
         new_path: Vec<String>,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Subspace, DirectoryError> {
         self.check_version(trx, false).await?;
 
         if old_path.is_empty() || new_path.is_empty() {
@@ -182,14 +222,14 @@ impl DirectoryLayer {
 
         let mut old_nodes = self.find_nodes(&trx, old_path.to_owned()).await?;
         let last_node_from_old_path = match old_nodes.last_mut() {
-            None => return Err(DirectoryError::Message(String::from("empty path"))),
+            None => return Err(DirectoryError::PathDoesNotExists),
             Some(node) => node,
         };
 
         let content_subspace = last_node_from_old_path
             .content_subspace
             .as_ref()
-            .ok_or(DirectoryError::DirNotExists)?;
+            .ok_or(DirectoryError::PathDoesNotExists)?;
 
         let mut new_nodes = self.find_nodes(&trx, new_path.to_owned()).await?;
 
@@ -205,7 +245,7 @@ impl DirectoryLayer {
         }
 
         let last_node_from_new_path = match new_nodes.last_mut() {
-            None => return Err(DirectoryError::Message(String::from("empty path"))),
+            None => return Err(DirectoryError::PathDoesNotExists),
             Some(node) => {
                 if node.content_subspace.is_some() {
                     return Err(DirectoryError::DirAlreadyExists);
@@ -222,7 +262,7 @@ impl DirectoryLayer {
             .delete_content_from_node_subspace(&trx)
             .await?;
 
-        Ok(true)
+        Ok(content_subspace.to_owned())
     }
 
     /// `Remove` the subdirectory of this Directory located at `path` and all of its subdirectories,
@@ -242,7 +282,6 @@ impl DirectoryLayer {
         match nodes.last() {
             None => Ok(false),
             Some(node) => {
-                println!("found a node to delete: {:?}", node);
                 node.delete_content_from_node_subspace(&trx).await?;
                 node.delete_content_from_content_subspace(&trx).await?;
                 Ok(true)
@@ -250,25 +289,26 @@ impl DirectoryLayer {
         }
     }
 
-    /// List returns the names of the immediate subdirectories of the default root directory as a slice of strings.
+    /// `List` returns the names of the immediate subdirectories of the default root directory as a slice of strings.
     /// Each string is the name of the last component of a subdirectory's path.  
     pub async fn list(
         &self,
         trx: &Transaction,
-        paths: Vec<String>,
+        path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
-        let nodes = self.find_nodes(trx, paths.to_owned()).await?;
+        let nodes = self.find_nodes(trx, path.to_owned()).await?;
 
         match nodes.last() {
-            None => Err(DirectoryError::DirNotExists),
+            None => Err(DirectoryError::PathDoesNotExists),
             Some(node) => node.list(&trx).await,
         }
     }
 
+    /// `create_or_open_internal` is the function used to open and/or create a directory.
     async fn create_or_open_internal(
         &self,
         trx: &Transaction,
-        paths: Vec<String>,
+        path: Vec<String>,
         prefix: Vec<u8>,
         allow_create: bool,
         allow_open: bool,
@@ -277,21 +317,17 @@ impl DirectoryLayer {
 
         if !prefix.is_empty() && !self.allow_manual_prefixes {
             if self.path.is_empty() {
-                return Err(DirectoryError::Message(
-                    "cannot specify a prefix unless manual prefixes are enabled".to_string(),
-                ));
+                return Err(DirectoryError::PrefixNotAllowed);
             }
 
-            return Err(DirectoryError::Message(
-                "cannot specify a prefix in a partition".to_string(),
-            ));
+            return Err(DirectoryError::CannotPrefixInPartition);
         }
 
-        if paths.is_empty() {
+        if path.is_empty() {
             return Err(DirectoryError::NoPathProvided);
         }
 
-        let nodes = self.find_nodes(trx, paths.to_owned()).await?;
+        let nodes = self.find_nodes(trx, path.to_owned()).await?;
 
         let last_node = nodes.last().expect("could not contain 0 nodes");
 
@@ -313,7 +349,7 @@ impl DirectoryLayer {
 
         // at least one node does not exists, we need to create them
         if !allow_create {
-            return Err(DirectoryError::DirNotExists);
+            return Err(DirectoryError::PathDoesNotExists);
         }
 
         let mut parent_subspace = self.content_subspace.clone();
@@ -333,7 +369,7 @@ impl DirectoryLayer {
         Ok(parent_subspace)
     }
 
-    /// checks the version of the directory within FDB
+    /// `check_version` is checking the Directory's version in FDB.
     async fn check_version(
         &self,
         trx: &Transaction,
@@ -345,7 +381,7 @@ impl DirectoryLayer {
                 if allow_creation {
                     self.initialize_directory(trx).await
                 } else {
-                    Err(DirectoryError::DirNotExists)
+                    Err(DirectoryError::MissingDirectory)
                 }
             }
             Some(versions) => {
@@ -379,6 +415,7 @@ impl DirectoryLayer {
         }
     }
 
+    /// `initialize_directory` is initializing the directory
     async fn initialize_directory(&self, trx: &Transaction) -> Result<(), DirectoryError> {
         let mut value = vec![];
         value.write_u32::<LittleEndian>(MAJOR_VERSION).unwrap();
@@ -398,7 +435,7 @@ impl DirectoryLayer {
     async fn find_nodes(
         &self,
         trx: &Transaction,
-        paths: Vec<String>,
+        path: Vec<String>,
     ) -> Result<Vec<Node>, FdbError> {
         let mut nodes = vec![];
 
@@ -406,7 +443,7 @@ impl DirectoryLayer {
 
         let mut node_path = vec![];
 
-        for path_name in paths {
+        for path_name in path {
             node_path.push(path_name.to_owned());
             subspace = subspace.subspace::<(&[u8], String)>(&(
                 vec![DEFAULT_SUB_DIRS].as_slice(),
@@ -414,7 +451,7 @@ impl DirectoryLayer {
             ));
 
             let mut node = Node {
-                paths: node_path.clone(),
+                path: node_path.clone(),
                 layer: None,
                 node_subspace: subspace.to_owned(),
                 content_subspace: None,
@@ -423,7 +460,6 @@ impl DirectoryLayer {
             node.retrieve_layer(&trx).await?;
 
             if let Some(fdb_slice) = trx.get(node.node_subspace.bytes(), false).await? {
-                println!("found something in {:?}", node.node_subspace.to_owned());
                 node.content_subspace = Some(Subspace::from_bytes(&*fdb_slice));
             }
 

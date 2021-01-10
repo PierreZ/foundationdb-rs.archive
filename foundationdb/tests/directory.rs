@@ -128,7 +128,7 @@ fn test_create_or_open_directory() {
         vec![String::from("e")],
         vec![String::from("f")],
     )) {
-        Err(DirectoryError::DirNotExists) => {}
+        Err(DirectoryError::PathDoesNotExists) => {}
         Err(err) => panic!("should have NoPathProvided, got {:?}", err),
         Ok(()) => panic!("should not be fine"),
     }
@@ -249,10 +249,9 @@ async fn test_create_then_move_to(
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;
 
-    let move_output = directory
+    let _ = directory
         .move_to(&trx, old_paths.to_owned(), new_paths.to_owned())
         .await?;
-    assert!(move_output);
 
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;
@@ -282,10 +281,9 @@ async fn test_move_to(
     );
     let trx = db.create_trx()?;
 
-    let move_output = directory
+    let _ = directory
         .move_to(&trx, old_paths.to_owned(), new_paths.to_owned())
         .await?;
-    assert!(move_output);
 
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;

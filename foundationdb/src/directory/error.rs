@@ -20,17 +20,22 @@ pub enum DirectoryError {
     NoPathProvided,
     /// tried to create an already existing path.
     DirAlreadyExists,
-    /// missing path.
-    DirNotExists,
+    /// missing directory.
+    PathDoesNotExists,
+    /// Directory does not exists
+    MissingDirectory,
     /// Parent does not exists
     ParentDirDoesNotExists,
     /// the layer is incompatible.
     IncompatibleLayer,
     /// the destination directory cannot be a subdirectory of the source directory.
     BadDestinationDirectory,
-    Message(String),
     /// Bad directory version.
     Version(String),
+    /// cannot specify a prefix unless manual prefixes are enabled
+    PrefixNotAllowed,
+    /// cannot specify a prefix in a partition.
+    CannotPrefixInPartition,
     IoError(io::Error),
     FdbError(error::FdbError),
     HcaError(HcaError),
