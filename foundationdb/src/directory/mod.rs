@@ -173,27 +173,43 @@ impl DirectoryLayer {
     ) -> Result<bool, DirectoryError> {
         self.check_version(trx, false).await?;
 
+        if old_path.is_empty() || new_path.is_empty() {
+            return Err(DirectoryError::NoPathProvided);
+        }
+
+        if new_path.starts_with(old_path.as_slice()) {
+            return Err(DirectoryError::BadDestinationDirectory);
+        }
+
         let mut old_nodes = self.find_nodes(&trx, old_path.to_owned()).await?;
         let last_node_from_old_path = match old_nodes.last_mut() {
             None => return Err(DirectoryError::Message(String::from("empty path"))),
             Some(node) => node,
         };
+
         let content_subspace = last_node_from_old_path
             .content_subspace
             .as_ref()
             .ok_or(DirectoryError::DirNotExists)?;
 
         let mut new_nodes = self.find_nodes(&trx, new_path.to_owned()).await?;
+
         // assert that parent of the new node exists
-        if new_nodes.get(new_nodes.len() - 2).is_none() {
-            return Err(DirectoryError::ParentDirDoesNotExists);
+        if new_nodes.len() >= 2 {
+            match new_nodes.get(new_nodes.len() - 2) {
+                None => {}
+                Some(parent_node) => match parent_node.content_subspace {
+                    None => return Err(DirectoryError::ParentDirDoesNotExists),
+                    Some(_) => {}
+                },
+            }
         }
 
         let last_node_from_new_path = match new_nodes.last_mut() {
             None => return Err(DirectoryError::Message(String::from("empty path"))),
             Some(node) => {
                 if node.content_subspace.is_some() {
-                    return Err(DirectoryError::DirNotExists);
+                    return Err(DirectoryError::DirAlreadyExists);
                 }
                 node
             }

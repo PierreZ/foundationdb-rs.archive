@@ -18,7 +18,7 @@ fn test_directory() {
 
     eprintln!("clearing all keys");
     let trx = db.create_trx().expect("cannot create txn");
-    trx.clear_range(b"\x00", b"\xff");
+    trx.clear_range(b"", b"\xff");
     futures::executor::block_on(trx.commit()).expect("could not clear keys");
 
     eprintln!("creating directories");
@@ -50,21 +50,97 @@ fn test_directory() {
 
     futures::executor::block_on(test_bad_layer(&db)).expect("failed to run");
 
-    futures::executor::block_on(test_move_to(
+    futures::executor::block_on(test_create_then_move_to(
         &db,
         &directory,
         vec![String::from("d"), String::from("e")],
         vec![String::from("a"), String::from("g")],
     ))
     .expect("failed to run");
+
+    // trying to move on empty path
+    match futures::executor::block_on(test_move_to(
+        &db,
+        &directory,
+        vec![String::from("dsa")],
+        vec![],
+    )) {
+        Err(DirectoryError::NoPathProvided) => {}
+        _ => panic!("should have failed"),
+    }
+
+    // trying to move on empty path
+    match futures::executor::block_on(test_move_to(
+        &db,
+        &directory,
+        vec![],
+        vec![String::from("dsa")],
+    )) {
+        Err(DirectoryError::NoPathProvided) => {}
+        Err(err) => panic!("should have NoPathProvided, got {:?}", err),
+        Ok(()) => panic!("should not be fine"),
+    }
+
+    // source path does not exists
+    match futures::executor::block_on(test_move_to(
+        &db,
+        &directory,
+        vec![String::from("e")],
+        vec![String::from("f")],
+    )) {
+        Err(DirectoryError::DirNotExists) => {}
+        Err(err) => panic!("should have NoPathProvided, got {:?}", err),
+        Ok(()) => panic!("should not be fine"),
+    }
+
+    // destination's parent does not exists
+    match futures::executor::block_on(test_create_then_move_to(
+        &db,
+        &directory,
+        vec![String::from("a"), String::from("g")],
+        vec![String::from("i-do-not-exists-yet"), String::from("z")],
+    )) {
+        Err(DirectoryError::ParentDirDoesNotExists) => {}
+        Err(err) => panic!("should have ParentDirDoesNotExists, got {:?}", err),
+        Ok(()) => panic!("should not be fine"),
+    }
+
+    // destination not empty
+    match futures::executor::block_on(test_create_then_move_to(
+        &db,
+        &directory,
+        vec![String::from("a"), String::from("g")],
+        vec![String::from("a"), String::from("g")],
+    )) {
+        Err(DirectoryError::BadDestinationDirectory) => {}
+        Err(err) => panic!("should have BadDestinationDirectory, got {:?}", err),
+        Ok(()) => panic!("should not be fine"),
+    }
+
+    // cannot move to a children of the old-path
+    match futures::executor::block_on(test_create_then_move_to(
+        &db,
+        &directory,
+        vec![String::from("a"), String::from("g")],
+        vec![String::from("a"), String::from("g"), String::from("s")],
+    )) {
+        Err(DirectoryError::BadDestinationDirectory) => {}
+        Err(err) => panic!("should have BadDestinationDirectory, got {:?}", err),
+        Ok(()) => panic!("should not be fine"),
+    }
 }
 
-async fn test_move_to(
+async fn test_create_then_move_to(
     db: &Database,
     directory: &DirectoryLayer,
     old_paths: Vec<String>,
     new_paths: Vec<String>,
 ) -> Result<(), DirectoryError> {
+    eprintln!(
+        "moving {:?} to {:?}",
+        old_paths.to_owned(),
+        new_paths.to_owned()
+    );
     let trx = db.create_trx()?;
     let create_output = directory.create_or_open(&trx, old_paths.to_owned()).await?;
 
@@ -81,6 +157,38 @@ async fn test_move_to(
 
     let open_output = directory.open(&trx, new_paths).await?;
     assert_eq!(create_output.bytes(), open_output.bytes());
+
+    trx.commit().await.expect("could not commit");
+    let trx = db.create_trx()?;
+
+    let open_old_path = directory.open(&trx, old_paths).await;
+    assert!(open_old_path.is_err());
+
+    Ok(())
+}
+
+async fn test_move_to(
+    db: &Database,
+    directory: &DirectoryLayer,
+    old_paths: Vec<String>,
+    new_paths: Vec<String>,
+) -> Result<(), DirectoryError> {
+    eprintln!(
+        "moving {:?} to {:?}",
+        old_paths.to_owned(),
+        new_paths.to_owned()
+    );
+    let trx = db.create_trx()?;
+
+    let move_output = directory
+        .move_to(&trx, old_paths.to_owned(), new_paths.to_owned())
+        .await?;
+    assert!(move_output);
+
+    trx.commit().await.expect("could not commit");
+    let trx = db.create_trx()?;
+
+    directory.open(&trx, new_paths).await?;
 
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;

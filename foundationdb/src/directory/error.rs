@@ -26,6 +26,8 @@ pub enum DirectoryError {
     ParentDirDoesNotExists,
     /// the layer is incompatible.
     IncompatibleLayer,
+    /// the destination directory cannot be a subdirectory of the source directory.
+    BadDestinationDirectory,
     Message(String),
     /// Bad directory version.
     Version(String),
