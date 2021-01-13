@@ -151,7 +151,7 @@ impl Default for DirectoryLayer {
 }
 
 impl DirectoryLayer {
-    /// `CreateOrOpen` opens the directory specified by path (relative to this
+    /// `create_or_open` opens the directory specified by path (relative to this
     /// Directory), and returns the directory and its contents as a
     /// Subspace. If the directory does not exist, it is created
     /// (creating parent directories if necessary).
@@ -160,20 +160,33 @@ impl DirectoryLayer {
         txn: &Transaction,
         path: Vec<String>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, vec![], true, true)
+        self.create_or_open_internal(txn, path, None, true, true)
             .await
     }
 
-    /// `Create` creates a directory specified by path (relative to this
+    /// `create_or_open_with_prefix` is similar to `create_or_open`, but you can directly provide the keys
+    /// that will be used as the content_subspace, instead of using the allocator to allocate.
+    /// You must opened the directory with `allow_manual_prefixes` to do this.
+    pub async fn create_or_open_with_prefix(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        prefix: Vec<u8>,
+    ) -> Result<Subspace, DirectoryError> {
+        self.create_or_open_internal(txn, path, Some(prefix), true, true)
+            .await
+    }
+
+    /// `create` creates a directory specified by path (relative to this
     /// Directory), and returns the directory and its contents as a
     /// Subspace (or ErrDirAlreadyExists if the directory already exists).
     pub async fn create(&self, txn: &Transaction, path: Vec<String>) -> Option<DirectoryError> {
-        self.create_or_open_internal(txn, path, vec![], true, false)
+        self.create_or_open_internal(txn, path, None, true, false)
             .await
             .err()
     }
 
-    /// `Open` opens the directory specified by path (relative to this Directory),
+    /// `open` opens the directory specified by path (relative to this Directory),
     /// and returns the directory and its contents as a Subspace (or Err(DirNotExists)
     /// error if the directory does not exist, or ErrParentDirDoesNotExist if one of the parent
     /// directories in the path does not exist).
@@ -182,11 +195,11 @@ impl DirectoryLayer {
         txn: &Transaction,
         path: Vec<String>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, vec![], false, true)
+        self.create_or_open_internal(txn, path, None, false, true)
             .await
     }
 
-    /// `Exists` returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
+    /// `exists` returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
     pub async fn exists(
         &self,
         trx: &Transaction,
@@ -199,7 +212,7 @@ impl DirectoryLayer {
         }
     }
 
-    /// `Move moves` the directory from old_path to new_path(both relative to this
+    /// `move_to` the directory from old_path to new_path(both relative to this
     /// Directory), and returns the directory (at its new location) and its
     /// contents as a Subspace. Move will return an error if a directory
     /// does not exist at oldPath, a directory already exists at newPath, or the
@@ -265,7 +278,7 @@ impl DirectoryLayer {
         Ok(content_subspace.to_owned())
     }
 
-    /// `Remove` the subdirectory of this Directory located at `path` and all of its subdirectories,
+    /// `remove` the subdirectory of this Directory located at `path` and all of its subdirectories,
     /// as well as all of their contents.
     pub async fn remove(
         &self,
@@ -289,7 +302,7 @@ impl DirectoryLayer {
         }
     }
 
-    /// `List` returns the names of the immediate subdirectories of the default root directory as a slice of strings.
+    /// `list` returns the names of the immediate subdirectories of the default root directory as a slice of strings.
     /// Each string is the name of the last component of a subdirectory's path.  
     pub async fn list(
         &self,
@@ -309,13 +322,13 @@ impl DirectoryLayer {
         &self,
         trx: &Transaction,
         path: Vec<String>,
-        prefix: Vec<u8>,
+        prefix: Option<Vec<u8>>,
         allow_create: bool,
         allow_open: bool,
     ) -> Result<Subspace, DirectoryError> {
         self.check_version(trx, allow_create).await?;
 
-        if !prefix.is_empty() && !self.allow_manual_prefixes {
+        if prefix.is_some() && !self.allow_manual_prefixes {
             if self.path.is_empty() {
                 return Err(DirectoryError::PrefixNotAllowed);
             }
@@ -327,7 +340,7 @@ impl DirectoryLayer {
             return Err(DirectoryError::NoPathProvided);
         }
 
-        let nodes = self.find_nodes(trx, path.to_owned()).await?;
+        let mut nodes = self.find_nodes(trx, path.to_owned()).await?;
 
         let last_node = nodes.last().expect("could not contain 0 nodes");
 
@@ -352,21 +365,40 @@ impl DirectoryLayer {
             return Err(DirectoryError::PathDoesNotExists);
         }
 
-        let mut parent_subspace = self.content_subspace.clone();
+        let (last, parent_nodes) = nodes.split_last_mut().expect("already checked");
 
-        for mut node in nodes {
-            match node.content_subspace {
+        // let's create parents first.
+        let mut parent_subspace = self.content_subspace.clone();
+        for parent_node in parent_nodes {
+            match &parent_node.content_subspace {
                 None => {
                     // creating subspace
                     let allocator = self.allocator.allocate(trx).await?;
-                    parent_subspace = node
+                    parent_subspace = parent_node
                         .create_and_write_content_subspace(&trx, allocator, &parent_subspace)
                         .await?;
                 }
-                Some(subspace) => parent_subspace = subspace.clone(),
+                Some(subspace) => {
+                    parent_subspace = subspace.clone();
+                }
             }
         }
-        Ok(parent_subspace)
+
+        // parents are created, let's create the final node
+        match prefix {
+            None => {
+                let allocator = self.allocator.allocate(trx).await?;
+                parent_subspace = last
+                    .create_and_write_content_subspace(&trx, allocator, &parent_subspace)
+                    .await?;
+                Ok(parent_subspace)
+            }
+            Some(prefix) => {
+                last.persist_prefix_as_content_subspace(&trx, prefix.to_owned())
+                    .await?;
+                Ok(Subspace::from_bytes(prefix.as_ref()))
+            }
+        }
     }
 
     /// `check_version` is checking the Directory's version in FDB.

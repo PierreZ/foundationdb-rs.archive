@@ -58,6 +58,17 @@ impl Node {
         self.persist_content_subspace(&trx, subspace).await
     }
 
+    /// persist a prefix as the content_subspace
+    pub(crate) async fn persist_prefix_as_content_subspace(
+        &mut self,
+        trx: &Transaction,
+        prefix: Vec<u8>,
+    ) -> Result<(), DirectoryError> {
+        let key = self.node_subspace.to_owned();
+        trx.set(key.bytes(), &*prefix);
+        Ok(())
+    }
+
     /// `persist_content_subspace` will save the provided subspace as the `content_subspace`
     pub(crate) async fn persist_content_subspace(
         &mut self,

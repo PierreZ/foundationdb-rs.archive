@@ -83,8 +83,11 @@ fn test_create_or_open_directory() {
     ))
     .expect("failed to run");
 
-    // moves
+    futures::executor::block_on(test_prefix(&db, vec![0xFC, 0xFC])).expect("failed to run");
+    futures::executor::block_on(test_not_allowed_prefix(&db, vec![0xFC, 0xFC]))
+        .expect_err("should have failed");
 
+    // moves
     eprintln!("clearing all keys");
     let trx = db.create_trx().expect("cannot create txn");
     trx.clear_range(b"", b"\xff");
@@ -168,6 +171,34 @@ fn test_create_or_open_directory() {
         Err(err) => panic!("should have BadDestinationDirectory, got {:?}", err),
         Ok(()) => panic!("should not be fine"),
     }
+}
+
+async fn test_prefix(db: &Database, prefix: Vec<u8>) -> Result<(), DirectoryError> {
+    let directory = DirectoryLayer {
+        allow_manual_prefixes: true,
+        ..Default::default()
+    };
+    let trx = db.create_trx()?;
+
+    let subspace = directory
+        .create_or_open_with_prefix(&trx, vec![String::from("bad_layer")], prefix.to_owned())
+        .await?;
+
+    assert!(subspace.bytes().starts_with(prefix.as_slice()));
+    Ok(())
+}
+
+async fn test_not_allowed_prefix(db: &Database, prefix: Vec<u8>) -> Result<(), DirectoryError> {
+    let directory = DirectoryLayer {
+        ..Default::default()
+    };
+    let trx = db.create_trx()?;
+
+    directory
+        .create_or_open_with_prefix(&trx, vec![String::from("bad_layer")], prefix.to_owned())
+        .await?;
+
+    Ok(())
 }
 
 async fn test_create_then_delete(
