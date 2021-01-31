@@ -44,74 +44,6 @@ impl Node {
         }
     }
 
-    /// This will use the generated id and:
-    ///
-    /// * persist the node in the directory subspace
-    /// * create the content_subspace and returns it
-    pub(crate) async fn create_and_write_content_subspace(
-        &mut self,
-        trx: &Transaction,
-        generated_id: i64,
-        parent_subspace: &Subspace,
-    ) -> Result<Subspace, DirectoryError> {
-        let subspace = parent_subspace.subspace(&generated_id);
-        self.persist_content_subspace(&trx, subspace).await
-    }
-
-    /// persist a prefix as the content_subspace
-    pub(crate) async fn persist_prefix_as_content_subspace(
-        &mut self,
-        trx: &Transaction,
-        prefix: Vec<u8>,
-    ) -> Result<(), DirectoryError> {
-        let key = self.node_subspace.to_owned();
-        trx.set(key.bytes(), &*prefix);
-        Ok(())
-    }
-
-    /// `persist_content_subspace` will save the provided subspace as the `content_subspace`
-    pub(crate) async fn persist_content_subspace(
-        &mut self,
-        trx: &Transaction,
-        subspace: Subspace,
-    ) -> Result<Subspace, DirectoryError> {
-        let key = self.node_subspace.to_owned();
-        trx.set(key.bytes(), subspace.bytes());
-        self.content_subspace = Some(subspace.to_owned());
-        Ok(subspace)
-    }
-
-    /// delete subspace from the node_subspace
-    pub(crate) async fn delete_content_from_node_subspace(
-        &self,
-        trx: &Transaction,
-    ) -> Result<(), DirectoryError> {
-        println!(
-            "deleting node_subspace {:?}",
-            &self.node_subspace.to_owned()
-        );
-        trx.clear(&self.node_subspace.bytes());
-        Ok(())
-    }
-
-    /// delete subspace from the content_subspace
-    pub(crate) async fn delete_content_from_content_subspace(
-        &self,
-        trx: &Transaction,
-    ) -> Result<(), DirectoryError> {
-        match self.content_subspace.to_owned() {
-            None => Ok(()),
-            Some(subspace) => {
-                println!(
-                    "deleting content_subspace {:?}",
-                    &self.content_subspace.to_owned()
-                );
-                trx.clear_subspace_range(&subspace);
-                Ok(())
-            }
-        }
-    }
-
     /// retrieve the layer used for this node
     pub(crate) async fn retrieve_layer(&mut self, trx: &Transaction) -> Result<(), FdbError> {
         if self.layer == None {
@@ -136,7 +68,7 @@ impl Node {
         for fdb_value in fdb_values {
             let subspace = Subspace::from_bytes(fdb_value.key());
             // stripping from subspace
-            let sub_directory: (Vec<u8>, String) = self.node_subspace.unpack(subspace.bytes())?;
+            let sub_directory: (i64, String) = self.node_subspace.unpack(subspace.bytes())?;
             results.push(sub_directory.1);
         }
         Ok(results)

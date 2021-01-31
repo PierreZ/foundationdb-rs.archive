@@ -7,6 +7,7 @@
 
 use foundationdb::directory::error::DirectoryError;
 use foundationdb::directory::DirectoryLayer;
+use foundationdb::tuple::Subspace;
 use foundationdb::*;
 
 mod common;
@@ -41,136 +42,7 @@ fn test_create_or_open_directory() {
     futures::executor::block_on(test_list(&db, &directory, vec![String::from("a")], 10))
         .expect("failed to run");
 
-    futures::executor::block_on(test_children_content_subspace(
-        &db,
-        &directory,
-        vec![String::from("c")],
-    ))
-    .expect("failed to run");
-
-    futures::executor::block_on(test_bad_layer(&db)).expect("failed to run");
-
-    // testing deletes
-
-    eprintln!("clearing all keys");
-    let trx = db.create_trx().expect("cannot create txn");
-    trx.clear_range(b"", b"\xff");
-    futures::executor::block_on(trx.commit()).expect("could not clear keys");
-
-    eprintln!("creating directories");
-    let directory = DirectoryLayer::default();
-
-    // test deletions, first we need to create it
-    futures::executor::block_on(test_create_or_open_async(
-        &db,
-        &directory,
-        vec![String::from("deletion")],
-    ))
-    .expect("failed to run");
-    // then delete it
-    futures::executor::block_on(test_delete_async(
-        &db,
-        &directory,
-        vec![String::from("deletion")],
-    ))
-    .expect("failed to run");
-
-    futures::executor::block_on(test_create_then_delete(
-        &db,
-        &directory,
-        vec![String::from("n0")],
-        1,
-    ))
-    .expect("failed to run");
-
-    futures::executor::block_on(test_prefix(&db, vec![0xFC, 0xFC])).expect("failed to run");
-    futures::executor::block_on(test_not_allowed_prefix(&db, vec![0xFC, 0xFC]))
-        .expect_err("should have failed");
-
-    // moves
-    eprintln!("clearing all keys");
-    let trx = db.create_trx().expect("cannot create txn");
-    trx.clear_range(b"", b"\xff");
-    futures::executor::block_on(trx.commit()).expect("could not clear keys");
-
-    futures::executor::block_on(test_create_then_move_to(
-        &db,
-        &directory,
-        vec![String::from("d"), String::from("e")],
-        vec![String::from("a")],
-    ))
-    .expect("failed to run");
-
-    // trying to move on empty path
-    match futures::executor::block_on(test_move_to(
-        &db,
-        &directory,
-        vec![String::from("dsa")],
-        vec![],
-    )) {
-        Err(DirectoryError::NoPathProvided) => {}
-        _ => panic!("should have failed"),
-    }
-
-    // trying to move on empty path
-    match futures::executor::block_on(test_move_to(
-        &db,
-        &directory,
-        vec![],
-        vec![String::from("dsa")],
-    )) {
-        Err(DirectoryError::NoPathProvided) => {}
-        Err(err) => panic!("should have NoPathProvided, got {:?}", err),
-        Ok(()) => panic!("should not be fine"),
-    }
-
-    // source path does not exists
-    match futures::executor::block_on(test_move_to(
-        &db,
-        &directory,
-        vec![String::from("e")],
-        vec![String::from("f")],
-    )) {
-        Err(DirectoryError::PathDoesNotExists) => {}
-        Err(err) => panic!("should have NoPathProvided, got {:?}", err),
-        Ok(()) => panic!("should not be fine"),
-    }
-
-    // destination's parent does not exists
-    match futures::executor::block_on(test_create_then_move_to(
-        &db,
-        &directory,
-        vec![String::from("a"), String::from("g")],
-        vec![String::from("i-do-not-exists-yet"), String::from("z")],
-    )) {
-        Err(DirectoryError::ParentDirDoesNotExists) => {}
-        Err(err) => panic!("should have ParentDirDoesNotExists, got {:?}", err),
-        Ok(()) => panic!("should not be fine"),
-    }
-
-    // destination not empty
-    match futures::executor::block_on(test_create_then_move_to(
-        &db,
-        &directory,
-        vec![String::from("a"), String::from("g")],
-        vec![String::from("a"), String::from("g")],
-    )) {
-        Err(DirectoryError::BadDestinationDirectory) => {}
-        Err(err) => panic!("should have BadDestinationDirectory, got {:?}", err),
-        Ok(()) => panic!("should not be fine"),
-    }
-
-    // cannot move to a children of the old-path
-    match futures::executor::block_on(test_create_then_move_to(
-        &db,
-        &directory,
-        vec![String::from("a"), String::from("g")],
-        vec![String::from("a"), String::from("g"), String::from("s")],
-    )) {
-        Err(DirectoryError::BadDestinationDirectory) => {}
-        Err(err) => panic!("should have BadDestinationDirectory, got {:?}", err),
-        Ok(()) => panic!("should not be fine"),
-    }
+    futures::executor::block_on(test_bad_layer(&db)).expect_err("should have failed");
 }
 
 async fn test_prefix(db: &Database, prefix: Vec<u8>) -> Result<(), DirectoryError> {
@@ -334,21 +206,17 @@ async fn test_create_then_open_async(
     db: &Database,
     directory: &DirectoryLayer,
     paths: Vec<String>,
-) -> FdbResult<()> {
+) -> Result<Subspace, DirectoryError> {
     eprintln!("creating directory for {:?}", paths.to_owned());
     let trx = db.create_trx()?;
-    let create_output = directory.create_or_open(&trx, paths.to_owned()).await;
-    assert!(create_output.is_ok());
+    directory.create_or_open(&trx, paths.to_owned()).await?;
 
-    trx.commit().await?;
+    trx.commit().await.expect("could not commit");
+
     eprintln!("opening directory for {:?}", paths.to_owned());
 
     let trx = db.create_trx()?;
-    let get_output = directory.open(&trx, paths.to_owned()).await;
-    assert!(get_output.is_ok());
-
-    assert_eq!(create_output.unwrap().bytes(), get_output.unwrap().bytes());
-    Ok(())
+    directory.open(&trx, paths.to_owned()).await
 }
 
 async fn test_create_or_open_async(
@@ -387,7 +255,7 @@ async fn test_delete_async(
 }
 
 /// testing that we throwing Err(DirectoryError::IncompatibleLayer)
-async fn test_bad_layer(db: &Database) -> Result<(), DirectoryError> {
+async fn test_bad_layer(db: &Database) -> Result<Subspace, DirectoryError> {
     let directory = DirectoryLayer {
         layer: vec![0u8],
         ..Default::default()
@@ -403,15 +271,9 @@ async fn test_bad_layer(db: &Database) -> Result<(), DirectoryError> {
         ..Default::default()
     };
 
-    let result = directory
+    return directory
         .create_or_open(&trx, vec![String::from("bad_layer")])
         .await;
-    match result {
-        Err(DirectoryError::IncompatibleLayer) => {}
-        _ => panic!("should have been an IncompatibleLayer error"),
-    }
-
-    Ok(())
 }
 
 /// testing list functionality. Will open paths and create n sub-folders.
@@ -454,43 +316,6 @@ async fn test_list(
             Err(err) => panic!("should have found {:?}: {:?}", sub_path, err),
         }
     }
-
-    Ok(())
-}
-
-/// checks that the content_subspace of the children is inside the parent
-async fn test_children_content_subspace(
-    db: &Database,
-    directory: &DirectoryLayer,
-    paths: Vec<String>,
-) -> Result<(), DirectoryError> {
-    let trx = db.create_trx()?;
-
-    eprintln!("parent = {:?}", paths.to_owned());
-
-    let root_subspace = directory.create_or_open(&trx, paths.to_owned()).await?;
-
-    let mut children_path = paths.clone();
-    children_path.push(String::from("nested"));
-    eprintln!("children = {:?}", children_path.to_owned());
-
-    let children_subspace = directory
-        .create_or_open(&trx, children_path.to_owned())
-        .await?;
-
-    assert!(
-        children_subspace.bytes().starts_with(root_subspace.bytes()),
-        "children subspace '{:?} does not start with parent subspace '{:?}'",
-        children_subspace.bytes(),
-        root_subspace.bytes()
-    );
-
-    trx.commit().await.expect("could not commit");
-    let trx = db.create_trx()?;
-
-    let open_children_subspace = directory.open(&trx, children_path.to_owned()).await?;
-
-    assert_eq!(children_subspace.bytes(), open_children_subspace.bytes());
 
     Ok(())
 }
