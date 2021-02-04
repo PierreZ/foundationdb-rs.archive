@@ -10,6 +10,7 @@ use foundationdb::directory::DirectoryLayer;
 use foundationdb::tuple::Subspace;
 use foundationdb::*;
 
+
 mod common;
 
 #[test]
@@ -25,7 +26,7 @@ fn test_create_or_open_directory() {
     eprintln!("creating directories");
     let directory = DirectoryLayer::default();
 
-    futures::executor::block_on(test_create_or_open_async(
+    futures::executor::block_on(test_create_or_open_async_then_delete(
         &db,
         &directory,
         vec![String::from("a")],
@@ -42,21 +43,39 @@ fn test_create_or_open_directory() {
     futures::executor::block_on(test_list(&db, &directory, vec![String::from("a")], 10))
         .expect("failed to run");
 
+    futures::executor::block_on(test_prefix(
+        &db,
+        vec![String::from("prefix")],
+        vec![0x01, 0x02],
+    ))
+    .expect("failed to run");
+
     futures::executor::block_on(test_bad_layer(&db)).expect_err("should have failed");
 }
 
-async fn test_prefix(db: &Database, prefix: Vec<u8>) -> Result<(), DirectoryError> {
+async fn test_prefix(
+    db: &Database,
+    path: Vec<String>,
+    prefix: Vec<u8>,
+) -> Result<(), DirectoryError> {
     let directory = DirectoryLayer {
-        allow_manual_prefixes: true,
+        allow_manual_prefix: true,
         ..Default::default()
     };
     let trx = db.create_trx()?;
 
     let subspace = directory
-        .create_or_open_with_prefix(&trx, vec![String::from("bad_layer")], prefix.to_owned())
+        .create_or_open(&trx, path.to_owned(), Some(prefix.to_owned()), None)
         .await?;
 
-    assert!(subspace.bytes().starts_with(prefix.as_slice()));
+    assert!(
+        subspace.bytes().eq(prefix.as_slice()),
+        "{:?} != {:?}",
+        subspace.bytes(),
+        prefix.as_slice()
+    );
+
+    trx.commit().await.expect("cannot commit");
     Ok(())
 }
 
@@ -67,7 +86,12 @@ async fn test_not_allowed_prefix(db: &Database, prefix: Vec<u8>) -> Result<(), D
     let trx = db.create_trx()?;
 
     directory
-        .create_or_open_with_prefix(&trx, vec![String::from("bad_layer")], prefix.to_owned())
+        .create_or_open(
+            &trx,
+            vec![String::from("bad_layer")],
+            Some(prefix.to_owned()),
+            None,
+        )
         .await?;
 
     Ok(())
@@ -81,7 +105,9 @@ async fn test_create_then_delete(
 ) -> Result<(), DirectoryError> {
     // creating directory
     let trx = db.create_trx()?;
-    directory.create_or_open(&trx, paths.to_owned()).await?;
+    directory
+        .create_or_open(&trx, paths.to_owned(), None, None)
+        .await?;
 
     trx.commit().await.expect("could not commit");
 
@@ -98,7 +124,9 @@ async fn test_create_then_delete(
 
         // creating subfolders
         eprintln!("creating {:?}", sub_path.to_owned());
-        directory.create(&trx, sub_path.to_owned()).await;
+        directory
+            .create(&trx, sub_path.to_owned(), None, None)
+            .await;
         trx.commit().await.expect("could not commit");
 
         // checking it does exists
@@ -147,7 +175,9 @@ async fn test_create_then_move_to(
         new_paths.to_owned()
     );
     let trx = db.create_trx()?;
-    let create_output = directory.create_or_open(&trx, old_paths.to_owned()).await?;
+    let create_output = directory
+        .create_or_open(&trx, old_paths.to_owned(), None, None)
+        .await?;
 
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;
@@ -159,13 +189,13 @@ async fn test_create_then_move_to(
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;
 
-    let open_output = directory.open(&trx, new_paths).await?;
+    let open_output = directory.open(&trx, new_paths, None).await?;
     assert_eq!(create_output.bytes(), open_output.bytes());
 
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;
 
-    let open_old_path = directory.open(&trx, old_paths).await;
+    let open_old_path = directory.open(&trx, old_paths, None).await;
     assert!(open_old_path.is_err());
 
     Ok(())
@@ -191,12 +221,12 @@ async fn test_move_to(
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;
 
-    directory.open(&trx, new_paths).await?;
+    directory.open(&trx, new_paths, None).await?;
 
     trx.commit().await.expect("could not commit");
     let trx = db.create_trx()?;
 
-    let open_old_path = directory.open(&trx, old_paths).await;
+    let open_old_path = directory.open(&trx, old_paths, None).await;
     assert!(open_old_path.is_err());
 
     Ok(())
@@ -209,46 +239,44 @@ async fn test_create_then_open_async(
 ) -> Result<Subspace, DirectoryError> {
     eprintln!("creating directory for {:?}", paths.to_owned());
     let trx = db.create_trx()?;
-    directory.create_or_open(&trx, paths.to_owned()).await?;
+    directory
+        .create_or_open(&trx, paths.to_owned(), None, None)
+        .await?;
 
     trx.commit().await.expect("could not commit");
 
     eprintln!("opening directory for {:?}", paths.to_owned());
 
     let trx = db.create_trx()?;
-    directory.open(&trx, paths.to_owned()).await
+    directory.open(&trx, paths.to_owned(), None).await
 }
 
-async fn test_create_or_open_async(
+async fn test_create_or_open_async_then_delete(
     db: &Database,
     directory: &DirectoryLayer,
     paths: Vec<String>,
 ) -> FdbResult<()> {
     let trx = db.create_trx()?;
-    let create_output = directory.create_or_open(&trx, paths.to_owned()).await;
+    let create_output = directory
+        .create_or_open(&trx, paths.to_owned(), None, None)
+        .await;
     assert!(create_output.is_ok());
-    Ok(())
-}
+    trx.commit().await.expect("cannot commit");
 
-async fn test_delete_async(
-    db: &Database,
-    directory: &DirectoryLayer,
-    paths: Vec<String>,
-) -> FdbResult<()> {
+    // removing folder
     let trx = db.create_trx()?;
-    let _ = directory
-        .create_or_open(&trx, paths.to_owned())
-        .await
-        .expect("cannot create");
-    eprintln!("removing {:?}", paths.to_owned());
     let delete_output = directory.remove(&trx, paths.to_owned()).await;
     assert!(delete_output.is_ok());
-    trx.commit().await.expect("could not commit");
+    trx.commit().await.expect("cannot commit");
 
     // checking it does not exists
     let trx = db.create_trx()?;
-    let exists = directory.exists(&trx, paths.to_owned()).await.expect("bla");
-    assert!(!exists, "path {:?} should not exists", paths.to_owned());
+    let exists = directory
+        .exists(&trx, paths.to_owned())
+        .await
+        .expect("cannot call exists");
+    assert_eq!(exists, false, "{:?} should not exists", &paths);
+
     trx.commit().await.expect("could not commit");
 
     Ok(())
@@ -257,22 +285,20 @@ async fn test_delete_async(
 /// testing that we throwing Err(DirectoryError::IncompatibleLayer)
 async fn test_bad_layer(db: &Database) -> Result<Subspace, DirectoryError> {
     let directory = DirectoryLayer {
-        layer: vec![0u8],
         ..Default::default()
     };
     let trx = db.create_trx()?;
 
     directory
-        .create_or_open(&trx, vec![String::from("bad_layer")])
+        .create_or_open(&trx, vec![String::from("bad_layer")], None, Some(vec![0u8]))
         .await?;
 
     let directory = DirectoryLayer {
-        layer: vec![1u8],
         ..Default::default()
     };
 
     return directory
-        .create_or_open(&trx, vec![String::from("bad_layer")])
+        .create_or_open(&trx, vec![String::from("bad_layer")], None, Some(vec![1u8]))
         .await;
 }
 
@@ -285,7 +311,7 @@ async fn test_list(
 ) -> Result<(), DirectoryError> {
     // creating directory
     let trx = db.create_trx()?;
-    directory.create(&trx, paths.to_owned()).await;
+    directory.create(&trx, paths.to_owned(), None, None).await;
     trx.commit().await.expect("could not commit");
 
     for i in 0..sub_path_to_create {
@@ -294,7 +320,9 @@ async fn test_list(
         let mut sub_path = paths.clone();
         sub_path.push(format!("node-{}", i));
         eprintln!("creating {:?}", sub_path.to_owned());
-        directory.create(&trx, sub_path.to_owned()).await;
+        directory
+            .create(&trx, sub_path.to_owned(), None, None)
+            .await;
 
         trx.commit().await.expect("could not commit");
     }

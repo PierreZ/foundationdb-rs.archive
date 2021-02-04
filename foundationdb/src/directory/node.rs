@@ -26,6 +26,10 @@ pub(crate) struct Node {
     pub(crate) node_subspace: Subspace,
     /// the content_subspace of this node.
     pub(crate) content_subspace: Option<Subspace>,
+
+    /// The subspace used to find this node, attached to a parent.
+    /// Used to properly handle deletes/move
+    pub(crate) parent_node_reference: Subspace,
 }
 
 impl Node {
@@ -72,5 +76,40 @@ impl Node {
             results.push(sub_directory.1);
         }
         Ok(results)
+    }
+
+    pub(crate) async fn remove_all(&self, trx: &Transaction) -> Result<(), DirectoryError> {
+        self.remove_children_nodes(trx).await?;
+        self.remove_parent_reference(trx).await?;
+        self.remove_content_subspace(trx).await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn remove_children_nodes(
+        &self,
+        trx: &Transaction,
+    ) -> Result<(), DirectoryError> {
+        trx.clear_subspace_range(&self.node_subspace);
+        Ok(())
+    }
+
+    pub(crate) async fn remove_parent_reference(
+        &self,
+        trx: &Transaction,
+    ) -> Result<(), DirectoryError> {
+        trx.clear(&self.parent_node_reference.bytes());
+        Ok(())
+    }
+
+    pub(crate) async fn remove_content_subspace(
+        &self,
+        trx: &Transaction,
+    ) -> Result<(), DirectoryError> {
+        match &self.content_subspace {
+            None => {}
+            Some(content_subspace) => trx.clear_subspace_range(&content_subspace),
+        };
+        Ok(())
     }
 }

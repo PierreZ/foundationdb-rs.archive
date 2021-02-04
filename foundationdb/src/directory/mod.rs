@@ -59,7 +59,8 @@ const DEFAULT_SUB_DIRS: i64 = 0;
 ///         // the transaction used to read/write the directory.
 ///         &trx,
 ///         // the path used, which can view as a UNIX path like `/app/my-app`.
-///         vec![String::from("app"), String::from("my-app")]
+///         vec![String::from("app"), String::from("my-app")],
+///         None, None,
 ///     ).await;
 ///     assert_eq!(true, content_subspace.is_ok());
 ///     
@@ -94,7 +95,7 @@ const DEFAULT_SUB_DIRS: i64 = 0;
 ///                | (0,"app",0,"my-app","layer")="" # layer allow an ownership's mecanism
 ///                | (0,"app",0,"my-app")=42         # id allocated by the hca for "layer"
 ///                +
-//
+///
 ///
 ///                +
 ///                |
@@ -111,6 +112,7 @@ const DEFAULT_SUB_DIRS: i64 = 0;
 /// * `()` `Tuples`,
 /// * `#` comments.
 ///
+#[derive(Debug)]
 pub struct DirectoryLayer {
     /// the subspace used to store the hierarchy of paths. Each path is composed of Nodes.
     /// Default is `Subspace::all()`.
@@ -123,15 +125,9 @@ pub struct DirectoryLayer {
     /// Default HAC is using  `Subspace::from_bytes(b"hca")` as the subspace.
     pub allocator: HighContentionAllocator,
 
-    pub allow_manual_prefixes: bool,
+    pub allow_manual_prefix: bool,
 
     pub path: Vec<String>,
-    /// This is set at node creation time and never mutated by the directory layer.
-    /// If a layer is provided when opening nodes it checks to see that the layer matches nodes that are read.
-    /// When there's a mismatch an error is thrown.
-    ///
-    /// It can be used as a primitive "ownership" over part of the directory tree.
-    pub layer: Vec<u8>,
 }
 
 impl Default for DirectoryLayer {
@@ -143,8 +139,7 @@ impl Default for DirectoryLayer {
             allocator: HighContentionAllocator::new(
                 Subspace::from_bytes(DEFAULT_NODE_PREFIX).subspace(&DEFAULT_HCA_PREFIX),
             ),
-            allow_manual_prefixes: false,
-            layer: vec![],
+            allow_manual_prefix: false,
             path: vec![],
         }
     }
@@ -159,31 +154,25 @@ impl DirectoryLayer {
         &self,
         txn: &Transaction,
         path: Vec<String>,
+        prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, None, true, true)
-            .await
-    }
-
-    /// `create_or_open_with_prefix` is similar to `create_or_open`, but you can directly provide the keys
-    /// that will be used as the content_subspace, instead of using the allocator to allocate.
-    /// You must opened the directory with `allow_manual_prefixes` to do this.
-    pub async fn create_or_open_with_prefix(
-        &self,
-        txn: &Transaction,
-        path: Vec<String>,
-        prefix: Vec<u8>,
-    ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, Some(prefix), true, true)
+        self.create_or_open_internal(txn, path, prefix, layer, true, true)
             .await
     }
 
     /// `create` creates a directory specified by path (relative to this
     /// Directory), and returns the directory and its contents as a
     /// Subspace (or ErrDirAlreadyExists if the directory already exists).
-    pub async fn create(&self, txn: &Transaction, path: Vec<String>) -> Option<DirectoryError> {
-        self.create_or_open_internal(txn, path, None, true, false)
+    pub async fn create(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<Subspace, DirectoryError> {
+        self.create_or_open_internal(txn, path, prefix, layer, true, true)
             .await
-            .err()
     }
 
     /// `open` opens the directory specified by path (relative to this Directory),
@@ -194,8 +183,9 @@ impl DirectoryLayer {
         &self,
         txn: &Transaction,
         path: Vec<String>,
+        layer: Option<Vec<u8>>,
     ) -> Result<Subspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, None, false, true)
+        self.create_or_open_internal(txn, path, None, layer, false, true)
             .await
     }
 
@@ -205,9 +195,13 @@ impl DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<bool, DirectoryError> {
-        self.find_node(trx, path.to_owned(), false)
-            .await
-            .map(|_| true)
+        match dbg!(self.find_node(trx, path.to_owned(), false, None).await) {
+            Ok(_node) => Ok(true),
+            Err(err) => match err {
+                DirectoryError::PathDoesNotExists => Ok(false),
+                _ => Err(err),
+            },
+        }
     }
 
     /// `move_to` the directory from old_path to new_path(both relative to this
@@ -228,10 +222,12 @@ impl DirectoryLayer {
     /// as well as all of their contents.
     pub async fn remove(
         &self,
-        _trx: &Transaction,
-        _path: Vec<String>,
+        trx: &Transaction,
+        path: Vec<String>,
     ) -> Result<bool, DirectoryError> {
-        unimplemented!()
+        let node = self.find_node(trx, path.to_owned(), false, None).await?;
+        node.remove_all(trx).await?;
+        Ok(true)
     }
 
     /// `list` returns the names of the immediate subdirectories of the default root directory as a slice of strings.
@@ -241,7 +237,7 @@ impl DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
-        let node = self.find_node(trx, path.to_owned(), false).await?;
+        let node = self.find_node(trx, path.to_owned(), false, None).await?;
         node.list(&trx).await
     }
 
@@ -251,12 +247,14 @@ impl DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
         prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
         allow_create: bool,
         allow_open: bool,
     ) -> Result<Subspace, DirectoryError> {
+        dbg!(&path, &prefix, &layer, allow_create, allow_open);
         self.check_version(trx, allow_create).await?;
 
-        if prefix.is_some() && !self.allow_manual_prefixes {
+        if prefix.is_some() && !self.allow_manual_prefix {
             if self.path.is_empty() {
                 return Err(DirectoryError::PrefixNotAllowed);
             }
@@ -268,18 +266,24 @@ impl DirectoryLayer {
             return Err(DirectoryError::NoPathProvided);
         }
 
-        match self.find_node(&trx, path.to_owned(), allow_create).await {
+        match self
+            .find_node(&trx, path.to_owned(), allow_create, prefix)
+            .await
+        {
             Ok(node) => {
                 // node exists, checking layer
                 if !allow_open {
                     return Err(DirectoryError::DirAlreadyExists);
                 }
 
-                if !self.layer.is_empty() {
-                    node.check_layer(self.layer.to_owned())?;
+                match layer {
+                    None => {}
+                    Some(l) => {
+                        node.check_layer(l)?;
+                    }
                 }
 
-                Ok(node.content_subspace.clone().unwrap())
+                Ok(node.content_subspace.unwrap())
             }
             Err(err) => Err(err),
         }
@@ -349,16 +353,23 @@ impl DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
         allow_creation: bool,
+        prefix: Option<Vec<u8>>,
     ) -> Result<Node, DirectoryError> {
         let mut node = Node {
             layer: None,
             path: vec![],
             node_subspace: self.get_root_node_subspace(),
             content_subspace: None,
+            parent_node_reference: self.get_root_node_subspace(),
         };
         let mut node_path = vec![];
 
-        for path_name in path {
+        let last_path_index = match path.len() {
+            0 => 0,
+            size => size - 1,
+        };
+
+        for (i, path_name) in path.iter().enumerate() {
             node_path.push(path_name.to_owned());
             let key = node
                 .node_subspace
@@ -370,10 +381,23 @@ impl DirectoryLayer {
                         if !allow_creation {
                             return Err(DirectoryError::PathDoesNotExists);
                         }
-                        // creating the subspace for this not-existing node
-                        let allocator = self.allocator.allocate(trx).await?;
-                        let subspace = self.content_subspace.subspace(&allocator);
-                        (subspace.bytes().to_vec(), true)
+
+                        // if we are on the last node and a prefix was provided,
+                        // using the provided prefix as the content_subspace instead of
+                        // generating one.
+                        if i == last_path_index && prefix.is_some() {
+                            (
+                                Subspace::from_bytes(&*prefix.clone().unwrap())
+                                    .bytes()
+                                    .to_vec(),
+                                true,
+                            )
+                        } else {
+                            // creating the subspace for this not-existing node using the allocator
+                            let allocator = self.allocator.allocate(trx).await?;
+                            let subspace = self.content_subspace.subspace(&allocator);
+                            (subspace.bytes().to_vec(), true)
+                        }
                     }
                     Some(fdb_slice) => ((&*fdb_slice).to_vec(), false),
                 },
@@ -385,6 +409,7 @@ impl DirectoryLayer {
                 layer: None,
                 node_subspace: self.node_subspace.subspace(&prefix.as_slice()),
                 content_subspace: Some(Subspace::from_bytes(&prefix.as_slice())),
+                parent_node_reference: key.to_owned(),
             };
 
             node.retrieve_layer(&trx).await?;
