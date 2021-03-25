@@ -18,7 +18,7 @@ use crate::directory::error::DirectoryError;
 use crate::directory::node::Node;
 use crate::future::FdbSlice;
 use crate::tuple::hca::HighContentionAllocator;
-use crate::tuple::Subspace;
+use crate::tuple::{PackResult, Subspace, TuplePack, TupleUnpack};
 use crate::{FdbResult, Transaction};
 use byteorder::{LittleEndian, WriteBytesExt};
 
@@ -75,44 +75,7 @@ const DEFAULT_SUB_DIRS: i64 = 0;
 /// futures::executor::block_on(async_main()).expect("failed to run");
 /// drop(network);
 /// ```
-/// ## How it works
-///
-/// Here's what will be generated when using the Directory to create a path `/app/my-app`:
-///
-/// ```text
-///                +
-///                |
-///                | version = (1,0,0)              # Directory's version
-///                |
-///                |      +
-///                | "hca"|                          # used to allocate numbers like 12 and 42
-///                |      +
-///      \xFE      |
-///     node's     | (0,"app")=12                    # id allocated by the hca for "path"
-///    subspace    | (0,"app","layer")=""            # layer allow an ownership's mecanism
-///                |
-///                |
-///                | (0,"app",0,"my-app","layer")="" # layer allow an ownership's mecanism
-///                | (0,"app",0,"my-app")=42         # id allocated by the hca for "layer"
-///                +
-///
-///
-///                +
-///                |
-///                |
-///    (12,42)     |
-///    content     | # data's subspace for path "app","my-app"
-///   subspace     |
-///                |
-///                +
-/// ```
-/// In this schema:
-///
-/// * vertical lines represents `Subspaces`,
-/// * `()` `Tuples`,
-/// * `#` comments.
-///
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirectoryLayer {
     /// the subspace used to store the hierarchy of paths. Each path is composed of Nodes.
     /// Default is `Subspace::all()`.
@@ -156,7 +119,7 @@ impl DirectoryLayer {
         path: Vec<String>,
         prefix: Option<Vec<u8>>,
         layer: Option<Vec<u8>>,
-    ) -> Result<Subspace, DirectoryError> {
+    ) -> Result<DirectorySubspace, DirectoryError> {
         self.create_or_open_internal(txn, path, prefix, layer, true, true)
             .await
     }
@@ -170,7 +133,7 @@ impl DirectoryLayer {
         path: Vec<String>,
         prefix: Option<Vec<u8>>,
         layer: Option<Vec<u8>>,
-    ) -> Result<Subspace, DirectoryError> {
+    ) -> Result<DirectorySubspace, DirectoryError> {
         self.create_or_open_internal(txn, path, prefix, layer, true, true)
             .await
     }
@@ -184,7 +147,7 @@ impl DirectoryLayer {
         txn: &Transaction,
         path: Vec<String>,
         layer: Option<Vec<u8>>,
-    ) -> Result<Subspace, DirectoryError> {
+    ) -> Result<DirectorySubspace, DirectoryError> {
         self.create_or_open_internal(txn, path, None, layer, false, true)
             .await
     }
@@ -250,7 +213,7 @@ impl DirectoryLayer {
         layer: Option<Vec<u8>>,
         allow_create: bool,
         allow_open: bool,
-    ) -> Result<Subspace, DirectoryError> {
+    ) -> Result<DirectorySubspace, DirectoryError> {
         dbg!(&path, &prefix, &layer, allow_create, allow_open);
         self.check_version(trx, allow_create).await?;
 
@@ -267,7 +230,7 @@ impl DirectoryLayer {
         }
 
         match self
-            .find_node(&trx, path.to_owned(), allow_create, prefix)
+            .find_node(&trx, path.to_owned(), allow_create, prefix.to_owned())
             .await
         {
             Ok(node) => {
@@ -276,17 +239,56 @@ impl DirectoryLayer {
                     return Err(DirectoryError::DirAlreadyExists);
                 }
 
-                match layer {
+                match layer.to_owned() {
                     None => {}
                     Some(l) => {
                         node.check_layer(l)?;
                     }
                 }
 
-                Ok(node.content_subspace.unwrap())
+                let subspace = self.node_with_prefix(node.node_subspace.bytes().pack_to_vec());
+
+                self.contents_of_node(subspace, path.to_owned(), layer.to_owned())
+                    .await
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn node_with_prefix(&self, prefix: Vec<u8>) -> Option<Subspace> {
+        match prefix.len() {
+            0 => None,
+            _ => Some(self.node_subspace.subspace(&(prefix))),
+        }
+    }
+
+    // generate a DirectorySubspace
+    async fn contents_of_node(
+        &self,
+        subspace: Option<Subspace>,
+        path: Vec<String>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<DirectorySubspace, DirectoryError> {
+        let subspace_bytes = match subspace {
+            None => vec![],
+            Some(s) => s.bytes().to_vec(),
+        };
+
+        let p = self.node_subspace.unpack::<Vec<u8>>(&subspace_bytes)?;
+
+        let mut new_path = Vec::from(self.path.to_owned());
+        for p in path {
+            new_path.push(String::from(p));
+        }
+
+        let ss = Subspace::from_bytes(&*p);
+
+        let layer = match layer {
+            None => vec![],
+            Some(layer) => layer,
+        };
+
+        Ok(DirectorySubspace::new(ss, self.clone(), new_path, layer))
     }
 
     /// `check_version` is checking the Directory's version in FDB.
@@ -419,6 +421,8 @@ impl DirectoryLayer {
             }
         }
 
+        dbg!(&node);
+
         Ok(node)
     }
 
@@ -432,5 +436,123 @@ impl DirectoryLayer {
         let version_subspace: &[u8] = b"version";
         let version_key = self.get_root_node_subspace().subspace(&version_subspace);
         trx.get(version_key.bytes(), false).await
+    }
+
+    // TODO: check that we have the same behavior than the Go's bindings:
+    // func (dl directoryLayer) partitionSubpath(lpath, rpath []string) []string {
+    // 	r := make([]string, len(lpath)-len(dl.path)+len(rpath))
+    // 	copy(r, lpath[len(dl.path):])
+    // 	copy(r[len(lpath)-len(dl.path):], rpath)
+    // 	return r
+    // }
+    pub(crate) fn partition_subpath(
+        &self,
+        left_path: Vec<String>,
+        right_path: Vec<String>,
+    ) -> Vec<String> {
+        let mut r: Vec<String> = vec![];
+        let extract_left = &left_path[self.path.len()..];
+        r.extend_from_slice(extract_left);
+        r.extend_from_slice(right_path.as_slice());
+        r
+    }
+}
+
+/// `DirectorySubspace` is a directory that can act as a subspace
+#[derive(Debug)]
+pub struct DirectorySubspace {
+    subspace: Subspace,
+    directory: DirectoryLayer,
+    path: Vec<String>,
+    layer: Vec<u8>,
+}
+
+// directory related func
+impl DirectorySubspace {
+    pub fn new(
+        subspace: Subspace,
+        directory: DirectoryLayer,
+        path: Vec<String>,
+        layer: Vec<u8>,
+    ) -> Self {
+        DirectorySubspace {
+            subspace,
+            directory,
+            path,
+            layer,
+        }
+    }
+
+    pub async fn create_or_open(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<DirectorySubspace, DirectoryError> {
+        self.directory
+            .create_or_open(
+                txn,
+                self.directory
+                    .partition_subpath(self.path.clone(), path.clone()),
+                prefix,
+                layer,
+            )
+            .await
+    }
+
+    pub async fn create(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<DirectorySubspace, DirectoryError> {
+        self.directory
+            .create(
+                txn,
+                self.directory
+                    .partition_subpath(self.path.clone(), path.clone()),
+                prefix,
+                layer,
+            )
+            .await
+    }
+
+    pub async fn open(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<DirectorySubspace, DirectoryError> {
+        self.directory
+            .open(
+                txn,
+                self.directory
+                    .partition_subpath(self.path.clone(), path.clone()),
+                layer,
+            )
+            .await
+    }
+}
+
+// Subspace related func
+impl DirectorySubspace {
+    /// Returns the key encoding the specified Tuple with the prefix of this Subspace
+    /// prepended.
+    pub fn pack<T: TuplePack>(&self, v: &T) -> Vec<u8> {
+        self.subspace.pack(v)
+    }
+
+    /// `unpack` returns the Tuple encoded by the given key with the prefix of this Subspace
+    /// removed.  `unpack` will return an error if the key is not in this Subspace or does not
+    /// encode a well-formed Tuple.
+    pub fn unpack<'de, T: TupleUnpack<'de>>(&self, key: &'de [u8]) -> PackResult<T> {
+        self.subspace.unpack(key)
+    }
+
+    /// `bytes` returns the literal bytes of the prefix of this Subspace.
+    pub fn bytes(&self) -> &[u8] {
+        self.subspace.bytes()
     }
 }
