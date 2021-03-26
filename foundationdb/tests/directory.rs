@@ -5,11 +5,13 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use foundationdb::directory::directory_layer::DirectoryLayer;
+use foundationdb::directory::directory_subspace::DirectorySubspace;
 use foundationdb::directory::error::DirectoryError;
-use foundationdb::directory::{DirectoryLayer, DirectorySubspace};
-use foundationdb::tuple::Subspace;
+use foundationdb::directory::Directory;
+
 use foundationdb::*;
-use std::process::exit;
+
 
 mod common;
 
