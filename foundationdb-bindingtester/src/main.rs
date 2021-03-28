@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate log;
 
+// TODO: Fix 1330929912
+
 use foundationdb as fdb;
 use foundationdb_sys as fdb_sys;
 
@@ -706,8 +708,8 @@ impl StackMachine {
         }
     }
 
-    fn push_directory_err(&mut self, code: InstrCode, number: usize, err: DirectoryError) {
-        debug!("DIRECTORY_ERROR during {:?}: {:?}", code, err);
+    fn push_directory_err(&mut self, code: &InstrCode, number: usize, err: DirectoryError) {
+        error!("DIRECTORY_ERROR during {:?}: {:?}", code, err);
         let packed = pack(&(ERROR_DIRECTORY));
         self.push(number, Element::Bytes(packed.into()));
 
@@ -719,8 +721,8 @@ impl StackMachine {
         | InstrCode::DirectoryMoveTo
         | InstrCode::DirectoryOpenSubspace = code
         {
-            debug!(
-                "pushed NULL in the directory_stack at index {} because of an error",
+            error!(
+                "pushed NULL in the directory_stack at index {} because of the error",
                 self.directory_stack.len()
             );
             self.directory_stack.push(DirectoryStackItem::Null);
@@ -1738,7 +1740,7 @@ impl StackMachine {
                     }
                 };
 
-                let directory_subspace = match directory
+                match directory
                     .create(
                         txn,
                         (*path.get(0).unwrap().to_owned()).to_vec(),
@@ -1747,23 +1749,23 @@ impl StackMachine {
                     )
                     .await
                 {
-                    Ok(s) => s,
+                    Ok(directory_subspace) => {
+                        debug!(
+                            "pushing created {:?} at index {}",
+                            &directory_subspace,
+                            self.directory_stack.len()
+                        );
+                        self.directory_stack
+                            .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
+                    }
                     Err(e) => {
-                        panic!("could not call directory.create: {:?}", e);
+                        self.push_directory_err(&instr.code, number, e);
                     }
                 };
-
-                debug!(
-                    "pushing created {:?} at index {}",
-                    &directory_subspace,
-                    self.directory_stack.len()
-                );
-                self.directory_stack
-                    .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
             }
 
             DirectoryOpen => {
-                debug!("Open stack: {:?}", self.stack);
+                debug!("DirectoryOpen stack: {:?}", self.stack);
 
                 let path = self.pop_tuple(1).await;
                 let bytes_layer = self.pop_bytes().await;
@@ -1785,24 +1787,23 @@ impl StackMachine {
                     }
                 };
 
-                let directory_subspace = match directory
+                match directory
                     .open(txn, (*path.get(0).unwrap().to_owned()).to_vec(), layer)
                     .await
                 {
-                    Ok(s) => s,
+                    Ok(directory_subspace) => {
+                        debug!(
+                            "pushing newly opened {:?} at index {}",
+                            &directory_subspace,
+                            self.directory_stack.len()
+                        );
+                        self.directory_stack
+                            .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
+                    }
                     Err(e) => {
-                        self.push_directory_err(instr.code, number, e);
-                        return Err(());
+                        self.push_directory_err(&instr.code, number, e);
                     }
                 };
-
-                debug!(
-                    "pushing newly opened {:?} at index {}",
-                    &directory_subspace,
-                    self.directory_stack.len()
-                );
-                self.directory_stack
-                    .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
             }
 
             // Use the current directory for this operation.
@@ -1989,21 +1990,20 @@ impl StackMachine {
 
                 let paths = paths.get(0).expect("could not retrieve a path");
 
-                let children = match directory.list(txn, paths.to_vec()).await {
-                    Ok(v) => v,
+                match directory.list(txn, paths.to_vec()).await {
+                    Ok(children) => {
+                        let mut elements: Vec<Element> = vec![];
+                        for child in children {
+                            let element = Element::String(Cow::from(child));
+                            elements.push(element);
+                        }
+                        let tuple = Element::Tuple(elements);
+                        self.push(number, Element::Bytes(pack(&tuple).into()));
+                    }
                     Err(e) => {
-                        self.push_directory_err(instr.code, number, e);
-                        return Err(());
+                        self.push_directory_err(&instr.code, number, e);
                     }
                 };
-
-                let mut elements: Vec<Element> = vec![];
-                for child in children {
-                    let element = Element::String(Cow::from(child));
-                    elements.push(element);
-                }
-                let tuple = Element::Tuple(elements);
-                self.push(number, Element::Bytes(pack(&tuple).into()));
             }
 
             // Use the current directory for this operation.
@@ -2029,14 +2029,14 @@ impl StackMachine {
                 };
 
                 let paths = paths.get(0).expect("could not retrieve a path");
-                let exists = match directory.exists(txn, paths.to_owned()).await {
-                    Ok(exist) => exist,
+                match directory.exists(txn, paths.to_owned()).await {
+                    Ok(exists) => {
+                        self.push(number, Element::Int(i64::from(exists)));
+                    }
                     Err(e) => {
-                        self.push_directory_err(instr.code, number, e);
-                        return Err(());
+                        self.push_directory_err(&instr.code, number, e);
                     }
                 };
-                self.push(number, Element::Int(i64::from(exists)));
             }
 
             // Use the current directory for this operation.

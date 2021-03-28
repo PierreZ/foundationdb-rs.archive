@@ -143,7 +143,10 @@ impl Directory for DirectoryLayer {
 
     /// `exists` returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
     async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        match dbg!(self.find_node(trx, path.to_owned(), false, None).await) {
+        match dbg!(
+            self.find_or_create_node(trx, path.to_owned(), false, None, None)
+                .await
+        ) {
             Ok(_node) => Ok(true),
             Err(err) => match err {
                 DirectoryError::PathDoesNotExists => Ok(false),
@@ -169,7 +172,9 @@ impl Directory for DirectoryLayer {
     /// `remove` the subdirectory of this Directory located at `path` and all of its subdirectories,
     /// as well as all of their contents.
     async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        let node = self.find_node(trx, path.to_owned(), false, None).await?;
+        let node = self
+            .find_or_create_node(trx, path.to_owned(), false, None, None)
+            .await?;
         node.remove_all(trx).await?;
         Ok(true)
     }
@@ -181,7 +186,9 @@ impl Directory for DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
-        let node = self.find_node(trx, path.to_owned(), false, None).await?;
+        let node = self
+            .find_or_create_node(trx, path.to_owned(), false, None, None)
+            .await?;
         node.list(&trx).await
     }
 }
@@ -213,11 +220,16 @@ impl DirectoryLayer {
         }
 
         match self
-            .find_node(&trx, path.to_owned(), allow_create, prefix.to_owned())
+            .find_or_create_node(
+                &trx,
+                path.to_owned(),
+                allow_create,
+                prefix.to_owned(),
+                layer.to_owned(),
+            )
             .await
         {
             Ok(node) => {
-                // node exists, checking layer
                 if !allow_open {
                     return Err(DirectoryError::DirAlreadyExists);
                 }
@@ -333,7 +345,7 @@ impl DirectoryLayer {
         Ok(())
     }
 
-    async fn find_node(
+    async fn find_or_create_node(
         &self,
         trx: &Transaction,
         path: Vec<String>,
@@ -403,8 +415,6 @@ impl DirectoryLayer {
                 trx.set(key.bytes(), prefix.as_slice());
             }
         }
-
-        dbg!(&node);
 
         Ok(node)
     }
