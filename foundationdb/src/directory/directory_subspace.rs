@@ -1,9 +1,11 @@
 use crate::directory::directory_layer::DirectoryLayer;
 use crate::directory::error::DirectoryError;
-use crate::directory::Directory;
+use crate::directory::{compare_slice_string, Directory};
 use crate::tuple::{PackResult, Subspace, TuplePack, TupleUnpack};
 use crate::Transaction;
 use async_trait::async_trait;
+
+use std::cmp::Ordering;
 
 /// `DirectorySubspace` is a directory that can act as a subspace
 #[derive(Clone, Debug)]
@@ -95,12 +97,39 @@ impl Directory for DirectorySubspace {
             .await
     }
 
+    async fn move_directory(
+        &self,
+        trx: &Transaction,
+        new_path: Vec<String>,
+    ) -> Result<DirectorySubspace, DirectoryError> {
+        // equivalent of moveTo in Go
+        // return moveTo(t, d.dl, d.path, newAbsolutePath)
+        let partition_length = self.path.len();
+
+        if new_path.is_empty() {
+            return Err(DirectoryError::CannotMoveBetweenPartition);
+        }
+
+        dbg!(&new_path, &self.path);
+
+        if compare_slice_string(&new_path[..partition_length], &self.path) != Ordering::Equal {
+            Err(DirectoryError::CannotMoveBetweenPartition)
+        } else {
+            self.move_to(
+                trx,
+                Vec::from(&self.path[partition_length..]),
+                Vec::from(&new_path[partition_length..]),
+            )
+            .await
+        }
+    }
+
     async fn move_to(
         &self,
         trx: &Transaction,
         old_path: Vec<String>,
         new_path: Vec<String>,
-    ) -> Result<Subspace, DirectoryError> {
+    ) -> Result<DirectorySubspace, DirectoryError> {
         self.move_to(
             trx,
             self.directory

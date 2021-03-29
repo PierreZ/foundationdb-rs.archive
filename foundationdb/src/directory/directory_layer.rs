@@ -5,10 +5,12 @@ use crate::tuple::hca::HighContentionAllocator;
 use crate::tuple::{Subspace, TuplePack, TupleUnpack};
 use crate::{FdbResult, Transaction};
 
-use crate::directory::Directory;
 use crate::directory::DirectorySubspace;
+use crate::directory::{compare_slice_string, Directory};
 use async_trait::async_trait;
 use byteorder::{LittleEndian, WriteBytesExt};
+use std::cmp::Ordering;
+
 
 // TODO: useful?
 const _LAYER_VERSION: (u8, u8, u8) = (1, 0, 0);
@@ -17,7 +19,7 @@ const MINOR_VERSION: u32 = 0;
 const PATCH_VERSION: u32 = 0;
 const DEFAULT_NODE_PREFIX: &[u8] = b"\xFE";
 const DEFAULT_HCA_PREFIX: &[u8] = b"hca";
-const DEFAULT_SUB_DIRS: i64 = 0;
+pub(crate) const DEFAULT_SUB_DIRS: i64 = 0;
 
 /// An implementation of FoundationDB's directory that is compatible with other bindings.
 ///
@@ -144,7 +146,7 @@ impl Directory for DirectoryLayer {
     /// `exists` returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
     async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
         match dbg!(
-            self.find_or_create_node(trx, path.to_owned(), false, None, None)
+            self.find_or_create_node(trx, path.to_owned(), false, None)
                 .await
         ) {
             Ok(_node) => Ok(true),
@@ -155,6 +157,14 @@ impl Directory for DirectoryLayer {
         }
     }
 
+    async fn move_directory(
+        &self,
+        _trx: &Transaction,
+        _new_path: Vec<String>,
+    ) -> Result<DirectorySubspace, DirectoryError> {
+        Err(DirectoryError::CannotMoveRootDirectory)
+    }
+
     /// `move_to` the directory from old_path to new_path(both relative to this
     /// Directory), and returns the directory (at its new location) and its
     /// contents as a Subspace. Move will return an error if a directory
@@ -162,18 +172,66 @@ impl Directory for DirectoryLayer {
     /// parent directory of newPath does not exist.
     async fn move_to(
         &self,
-        _trx: &Transaction,
-        _old_path: Vec<String>,
-        _new_path: Vec<String>,
-    ) -> Result<Subspace, DirectoryError> {
-        unimplemented!()
+        trx: &Transaction,
+        old_path: Vec<String>,
+        new_path: Vec<String>,
+    ) -> Result<DirectorySubspace, DirectoryError> {
+        self.check_version(trx, false).await?;
+
+        let mut slice_end = old_path.len();
+        if slice_end > new_path.len() {
+            slice_end = new_path.len();
+        }
+
+        if compare_slice_string(&old_path[..], &new_path[..slice_end]) == Ordering::Equal
+            || old_path.is_empty()
+            || new_path.is_empty()
+        {
+            return Err(DirectoryError::CannotMoveBetweenSubdirectory);
+        }
+
+        let old_node = self
+            .find_or_create_node(&trx, old_path.to_owned(), false, None)
+            .await?;
+
+        if self.exists(&trx, new_path.to_owned()).await? {
+            return Err(DirectoryError::DirAlreadyExists);
+        }
+
+        let new_node_parent = self
+            .find_or_create_node(
+                &trx,
+                Vec::from(&new_path.to_owned()[..new_path.len() - 1]),
+                true,
+                None,
+            )
+            .await?;
+
+        let content_subspace = old_node.content_subspace.clone().unwrap();
+
+        let prefix = self.node_subspace.unpack(content_subspace.bytes())?;
+
+        if new_node_parent.is_new_node {
+            return Err(DirectoryError::CannotMoveMissingParent);
+        }
+
+        // create new node
+        self.find_or_create_node(&trx, new_path.to_owned(), true, Some(prefix))
+            .await?;
+
+        let child_name = old_path.last().unwrap().to_owned();
+        new_node_parent.remove_child(&trx, child_name).await;
+
+        return self
+            .contents_of_node(old_node.content_subspace, new_path, old_node.layer)
+            .await;
     }
 
     /// `remove` the subdirectory of this Directory located at `path` and all of its subdirectories,
     /// as well as all of their contents.
     async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
         let node = self
-            .find_or_create_node(trx, path.to_owned(), false, None, None)
+            .find_or_create_node(trx, path.to_owned(), false, None)
             .await?;
         node.remove_all(trx).await?;
         Ok(true)
@@ -187,7 +245,7 @@ impl Directory for DirectoryLayer {
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
         let node = self
-            .find_or_create_node(trx, path.to_owned(), false, None, None)
+            .find_or_create_node(trx, path.to_owned(), false, None)
             .await?;
         node.list(&trx).await
     }
@@ -220,13 +278,7 @@ impl DirectoryLayer {
         }
 
         match self
-            .find_or_create_node(
-                &trx,
-                path.to_owned(),
-                allow_create,
-                prefix.to_owned(),
-                layer.to_owned(),
-            )
+            .find_or_create_node(&trx, path.to_owned(), allow_create, prefix.to_owned())
             .await
         {
             Ok(node) => {
@@ -358,6 +410,7 @@ impl DirectoryLayer {
             node_subspace: self.get_root_node_subspace(),
             content_subspace: None,
             parent_node_reference: self.get_root_node_subspace(),
+            is_new_node: false,
         };
         let mut node_path = vec![];
 
@@ -407,6 +460,7 @@ impl DirectoryLayer {
                 node_subspace: self.node_subspace.subspace(&prefix.as_slice()),
                 content_subspace: Some(Subspace::from_bytes(&prefix.as_slice())),
                 parent_node_reference: key.to_owned(),
+                is_new_node: new_node,
             };
 
             node.retrieve_layer(&trx).await?;

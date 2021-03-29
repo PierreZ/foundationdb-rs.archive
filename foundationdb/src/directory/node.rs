@@ -6,6 +6,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use crate::directory::directory_layer::DEFAULT_SUB_DIRS;
 use crate::directory::DirectoryError;
 use crate::tuple::{Subspace, TuplePack};
 use crate::{FdbError, RangeOption, Transaction};
@@ -30,6 +31,9 @@ pub(crate) struct Node {
     /// The subspace used to find this node, attached to a parent.
     /// Used to properly handle deletes/move
     pub(crate) parent_node_reference: Subspace,
+
+    /// indicates if a Node is a new one.
+    pub(crate) is_new_node: bool,
 }
 
 impl Node {
@@ -87,6 +91,20 @@ impl Node {
         self.remove_children_nodes(trx).await?;
         self.remove_parent_reference(trx).await?;
         self.remove_content_subspace(trx).await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn remove_child(
+        &self,
+        trx: &Transaction,
+        child: String,
+    ) -> Result<(), DirectoryError> {
+        let subspace = self
+            .node_subspace
+            .subspace(&(DEFAULT_SUB_DIRS, child));
+
+        trx.clear_subspace_range(&subspace);
 
         Ok(())
     }

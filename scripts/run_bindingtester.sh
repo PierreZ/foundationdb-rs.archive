@@ -35,4 +35,5 @@ esac
   ./bindings/bindingtester/bindingtester.py --test-name scripted rust
   ./bindings/bindingtester/bindingtester.py --num-ops 1000 --api-version 610 --test-name api --compare python rust
   ./bindings/bindingtester/bindingtester.py --num-ops 1000 --api-version 610 --test-name api --concurrency 5 rust
+  ./bindings/bindingtester/bindingtester.py --num-ops 1000 --api-version 610 --test-name directory --concurrency 1 rust --seed 1330929912
 )

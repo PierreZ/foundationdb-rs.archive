@@ -1,8 +1,6 @@
 #[macro_use]
 extern crate log;
 
-// TODO: Fix 1330929912
-
 use foundationdb as fdb;
 use foundationdb_sys as fdb_sys;
 
@@ -1899,13 +1897,83 @@ impl StackMachine {
             //
             // Pop 2 tuples off the stack as [old_path, new_path]. Call move with the
             // specified old_path and new_path. Append the result onto the directory list.
-            DirectoryMove => unimplemented!(),
+            DirectoryMove => {
+                debug!("Move stack: {:?}", self.stack);
+
+                let paths = self.pop_tuple(2).await;
+
+                let directory = self
+                    .get_current_directory()
+                    .expect("could not find a directory");
+
+                let txn = match trx {
+                    TransactionState::Transaction(ref t) => t,
+                    _ => {
+                        panic!("could not find an active transaction");
+                    }
+                };
+
+                match directory
+                    .move_to(
+                        txn,
+                        (*paths.get(0).unwrap().to_vec()).to_owned(),
+                        (*paths.get(1).unwrap().to_vec()).to_owned(),
+                    )
+                    .await
+                {
+                    Ok(s) => {
+                        debug!(
+                            "pushing moved directory {:?} at index {}",
+                            &s,
+                            self.directory_stack.len()
+                        );
+                        self.directory_stack
+                            .push(DirectoryStackItem::DirectorySubspace(s));
+                    }
+                    Err(e) => {
+                        self.push_directory_err(&instr.code, number, e);
+                    }
+                };
+            }
 
             // Use the current directory for this operation.
             //
             // Pop 1 tuple off the stack as [new_absolute_path]. Call moveTo with the
             // specified new_absolute_path. Append the result onto the directory list.
-            DirectoryMoveTo => unimplemented!(),
+            DirectoryMoveTo => {
+                debug!("MoveTo stack: {:?}", self.stack);
+
+                let paths = self.pop_tuple(1).await;
+
+                let directory = self
+                    .get_current_directory()
+                    .expect("could not find a directory");
+
+                let txn = match trx {
+                    TransactionState::Transaction(ref t) => t,
+                    _ => {
+                        panic!("could not find an active transaction");
+                    }
+                };
+
+                match directory
+                    .move_directory(txn, (*paths.get(0).unwrap().to_vec()).to_owned())
+                    .await
+                {
+                    Ok(s) => {
+                        debug!(
+                            "pushing moved directory {:?} at index {}",
+                            &s,
+                            self.directory_stack.len()
+                        );
+                        self.directory_stack
+                            .push(DirectoryStackItem::DirectorySubspace(s));
+                    }
+                    Err(e) => {
+                        self.push_directory_err(&instr.code, number, e);
+                    }
+                };
+            }
 
             // Use the current directory for this operation.
             //

@@ -36,6 +36,13 @@ pub enum DirectoryError {
     PrefixNotAllowed,
     /// cannot specify a prefix in a partition.
     CannotPrefixInPartition,
+    /// the root directory cannot be moved
+    CannotMoveRootDirectory,
+    CannotMoveBetweenPartition,
+    /// the destination directory cannot be a subdirectory of the source directory
+    CannotMoveBetweenSubdirectory,
+    /// the parent of the destination directory does not exist. Create it first
+    CannotMoveMissingParent,
     IoError(io::Error),
     FdbError(error::FdbError),
     HcaError(HcaError),

@@ -19,13 +19,12 @@ mod node;
 use crate::directory::error::DirectoryError;
 
 
-
-use crate::tuple::{PackResult, Subspace, TuplePack, TupleUnpack};
-use crate::{Transaction};
+use crate::Transaction;
 
 use crate::directory::directory_subspace::DirectorySubspace;
 use async_trait::async_trait;
-
+use core::cmp;
+use std::cmp::Ordering;
 
 #[async_trait]
 pub trait Directory {
@@ -50,16 +49,33 @@ pub trait Directory {
         layer: Option<Vec<u8>>,
     ) -> Result<DirectorySubspace, DirectoryError>;
     async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError>;
+    async fn move_directory(
+        &self,
+        trx: &Transaction,
+        new_path: Vec<String>,
+    ) -> Result<DirectorySubspace, DirectoryError>;
     async fn move_to(
         &self,
         trx: &Transaction,
         old_path: Vec<String>,
         new_path: Vec<String>,
-    ) -> Result<Subspace, DirectoryError>;
+    ) -> Result<DirectorySubspace, DirectoryError>;
     async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError>;
     async fn list(
         &self,
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError>;
+}
+
+pub fn compare_slice_string(a: &[String], b: &[String]) -> cmp::Ordering {
+    for (ai, bi) in a.iter().zip(b.iter()) {
+        match ai.cmp(&bi) {
+            Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+
+    /* if every single element was equal, compare length */
+    a.len().cmp(&b.len())
 }
