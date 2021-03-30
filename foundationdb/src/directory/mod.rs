@@ -18,7 +18,6 @@ mod node;
 
 use crate::directory::error::DirectoryError;
 
-
 use crate::Transaction;
 
 use crate::directory::directory_subspace::DirectorySubspace;
@@ -66,6 +65,9 @@ pub trait Directory {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError>;
+
+    fn get_path(&self) -> Vec<String>;
+    fn get_layer(&self) -> Vec<u8>;
 }
 
 pub fn compare_slice_string(a: &[String], b: &[String]) -> cmp::Ordering {

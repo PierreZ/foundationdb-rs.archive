@@ -2,7 +2,7 @@ use crate::directory::error::DirectoryError;
 use crate::directory::node::Node;
 use crate::future::FdbSlice;
 use crate::tuple::hca::HighContentionAllocator;
-use crate::tuple::{Subspace, TuplePack, TupleUnpack};
+use crate::tuple::{Subspace, TuplePack};
 use crate::{FdbResult, Transaction};
 
 use crate::directory::DirectorySubspace;
@@ -10,7 +10,6 @@ use crate::directory::{compare_slice_string, Directory};
 use async_trait::async_trait;
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::cmp::Ordering;
-
 
 // TODO: useful?
 const _LAYER_VERSION: (u8, u8, u8) = (1, 0, 0);
@@ -30,41 +29,6 @@ pub(crate) const DEFAULT_SUB_DIRS: i64 = 0;
 /// A path is represented as a List of strings. Each directory has an associated subspace used to store its content.
 /// The layer maps each path to a short prefix used for the corresponding subspace.
 /// In effect, directories provide a level of indirection for access to subspaces.
-/// ## How-to use the Directory
-///
-/// ```rust
-/// use futures::prelude::*;
-///
-/// async fn async_main() -> foundationdb::FdbResult<()> {
-///     let db = foundationdb::Database::default()?;
-///
-///     // creates a transaction
-///     let trx = db.create_trx()?;
-///
-///     // creates a directory
-///     let directory = foundationdb::directory::DirectoryLayer::default();
-///
-///     // use the directory to create a subspace to use
-///     let content_subspace = directory.create_or_open(
-///         // the transaction used to read/write the directory.
-///         &trx,
-///         // the path used, which can view as a UNIX path like `/app/my-app`.
-///         vec![String::from("app"), String::from("my-app")],
-///         None, None,
-///     ).await;
-///     assert_eq!(true, content_subspace.is_ok());
-///     
-///     // Don't forget to commit your transaction to persist the subspace
-///     trx.commit().await?;
-///
-///     Ok(())
-/// }
-///
-/// // Safe because drop is called before the program exits
-/// let network = unsafe { foundationdb::boot() };
-/// futures::executor::block_on(async_main()).expect("failed to run");
-/// drop(network);
-/// ```
 #[derive(Debug, Clone)]
 pub struct DirectoryLayer {
     /// the subspace used to store the hierarchy of paths. Each path is composed of Nodes.
@@ -145,10 +109,20 @@ impl Directory for DirectoryLayer {
 
     /// `exists` returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
     async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        match dbg!(
-            self.find_or_create_node(trx, path.to_owned(), false, None)
-                .await
-        ) {
+        match self.check_version(trx, false).await {
+            Ok(()) => {}
+            Err(e) => {
+                return match e {
+                    DirectoryError::MissingDirectory => Ok(false),
+                    _ => Err(e),
+                }
+            }
+        }
+
+        match self
+            .find_or_create_node(trx, path.to_owned(), false, None)
+            .await
+        {
             Ok(_node) => Ok(true),
             Err(err) => match err {
                 DirectoryError::PathDoesNotExists => Ok(false),
@@ -220,7 +194,7 @@ impl Directory for DirectoryLayer {
             .await?;
 
         let child_name = old_path.last().unwrap().to_owned();
-        new_node_parent.remove_child(&trx, child_name).await;
+        new_node_parent.remove_child(&trx, child_name).await?;
 
         return self
             .contents_of_node(old_node.content_subspace, new_path, old_node.layer)
@@ -244,10 +218,19 @@ impl Directory for DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
+        dbg!(&path);
         let node = self
             .find_or_create_node(trx, path.to_owned(), false, None)
             .await?;
         node.list(&trx).await
+    }
+
+    fn get_path(&self) -> Vec<String> {
+        self.path.clone()
+    }
+
+    fn get_layer(&self) -> Vec<u8> {
+        vec![]
     }
 }
 

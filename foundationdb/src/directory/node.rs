@@ -74,7 +74,8 @@ impl Node {
     pub(crate) async fn list(&self, trx: &Transaction) -> Result<Vec<String>, DirectoryError> {
         let mut results = vec![];
 
-        let range_option = RangeOption::from(&self.node_subspace.to_owned());
+        let range_option =
+            RangeOption::from(&self.node_subspace.to_owned().subspace(&(DEFAULT_SUB_DIRS)));
 
         let fdb_values = trx.get_range(&range_option, 1_024, false).await?;
 
@@ -100,9 +101,7 @@ impl Node {
         trx: &Transaction,
         child: String,
     ) -> Result<(), DirectoryError> {
-        let subspace = self
-            .node_subspace
-            .subspace(&(DEFAULT_SUB_DIRS, child));
+        let subspace = self.node_subspace.subspace(&(DEFAULT_SUB_DIRS, child));
 
         trx.clear_subspace_range(&subspace);
 

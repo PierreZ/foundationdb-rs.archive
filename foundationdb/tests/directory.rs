@@ -9,9 +9,7 @@ use foundationdb::directory::directory_layer::DirectoryLayer;
 use foundationdb::directory::directory_subspace::DirectorySubspace;
 use foundationdb::directory::error::DirectoryError;
 use foundationdb::directory::Directory;
-
-use foundationdb::*;
-
+use foundationdb::{Database, FdbResult};
 
 mod common;
 

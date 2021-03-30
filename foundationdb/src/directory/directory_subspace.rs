@@ -16,7 +16,6 @@ pub struct DirectorySubspace {
     layer: Vec<u8>,
 }
 
-// directory related func
 impl DirectorySubspace {
     pub fn new(
         subspace: Subspace,
@@ -30,6 +29,9 @@ impl DirectorySubspace {
             path,
             layer,
         }
+    }
+    pub fn subspace<T: TuplePack>(&self, t: &T) -> Subspace {
+        self.subspace.subspace(t)
     }
 }
 
@@ -130,22 +132,24 @@ impl Directory for DirectorySubspace {
         old_path: Vec<String>,
         new_path: Vec<String>,
     ) -> Result<DirectorySubspace, DirectoryError> {
-        self.move_to(
-            trx,
-            self.directory
-                .partition_subpath(self.path.clone(), old_path.clone()),
-            self.directory
-                .partition_subpath(self.path.clone(), new_path),
-        )
-        .await
+        self.directory
+            .move_to(
+                trx,
+                self.directory
+                    .partition_subpath(self.path.clone(), old_path.clone()),
+                self.directory
+                    .partition_subpath(self.path.clone(), new_path),
+            )
+            .await
     }
 
     async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        self.remove(
-            trx,
-            self.directory.partition_subpath(self.path.clone(), path),
-        )
-        .await
+        self.directory
+            .remove(
+                trx,
+                self.directory.partition_subpath(self.path.clone(), path),
+            )
+            .await
     }
 
     async fn list(
@@ -153,11 +157,21 @@ impl Directory for DirectorySubspace {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
-        self.list(
-            trx,
-            self.directory.partition_subpath(self.path.clone(), path),
-        )
-        .await
+        dbg!(&path);
+        self.directory
+            .list(
+                trx,
+                self.directory.partition_subpath(self.path.clone(), path),
+            )
+            .await
+    }
+
+    fn get_path(&self) -> Vec<String> {
+        self.path.clone()
+    }
+
+    fn get_layer(&self) -> Vec<u8> {
+        self.layer.clone()
     }
 }
 
