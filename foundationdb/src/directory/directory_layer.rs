@@ -218,7 +218,6 @@ impl Directory for DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
-        dbg!(&path);
         let node = self
             .find_or_create_node(trx, path.to_owned(), false, None)
             .await?;
@@ -245,7 +244,6 @@ impl DirectoryLayer {
         allow_create: bool,
         allow_open: bool,
     ) -> Result<DirectorySubspace, DirectoryError> {
-        dbg!(&path, &prefix, &layer, allow_create, allow_open);
         self.check_version(trx, allow_create).await?;
 
         if prefix.is_some() && !self.allow_manual_prefix {

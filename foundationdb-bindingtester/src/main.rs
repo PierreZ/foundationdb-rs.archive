@@ -1835,7 +1835,7 @@ impl StackMachine {
                     }
                 };
 
-                let directory_subspace = match directory
+                match directory
                     .create_or_open(
                         txn,
                         (*path.get(0).unwrap().to_owned()).to_vec(),
@@ -1844,19 +1844,17 @@ impl StackMachine {
                     )
                     .await
                 {
-                    Ok(s) => s,
-                    Err(e) => {
-                        panic!("could not call directory.create: {:?}", e);
+                    Ok(directory_subspace) => {
+                        debug!(
+                            "pushing created_or_opened {:?} at index {}",
+                            &directory_subspace,
+                            self.directory_stack.len()
+                        );
+                        self.directory_stack
+                            .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
                     }
+                    Err(e) => self.push_directory_err(&instr.code, number, e),
                 };
-
-                debug!(
-                    "pushing created_or_opened {:?} at index {}",
-                    &directory_subspace,
-                    self.directory_stack.len()
-                );
-                self.directory_stack
-                    .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
             }
 
             // Pop the top item off the stack as [index]. Set the current directory list
@@ -2003,10 +2001,12 @@ impl StackMachine {
                 };
 
                 let paths = paths.get(0).expect("could not retrieve a path");
-                directory
-                    .remove(txn, paths.to_owned())
-                    .await
-                    .expect("could not delete");
+                match directory.remove(txn, paths.to_owned()).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.push_directory_err(&instr.code, number, e);
+                    }
+                }
             }
 
             // Use the current directory for this operation.
@@ -2177,13 +2177,36 @@ impl StackMachine {
             //
             // Pop 1 item off the stack as [key]. Check if the current directory contains
             // the specified key. Push 1 if it does and 0 if it doesn't.
-            DirectoryContains => unimplemented!(),
+            DirectoryContains => {
+                let raw_prefix = self.pop_bytes().await;
+                let b = self
+                    .get_current_directory_subspace()
+                    .unwrap()
+                    .subspace(&())
+                    .is_start_of(&raw_prefix);
+                self.push(number, Element::Bool(b));
+            }
 
             // Use the current directory for this operation.
             //
             // Pop 1 tuple off the stack as [tuple]. Open the subspace of the current
             // directory specified by tuple and push it onto the directory list.
-            DirectoryOpenSubspace => unimplemented!(),
+            DirectoryOpenSubspace => {
+                debug!("directory_open_subspace stack: {:?}", self.stack);
+                let n: usize = self.pop_usize().await;
+                debug!("DirectoryRange {}", n);
+                let mut buf = Vec::new();
+                for _ in 0..n {
+                    let element: Element = self.pop_element().await;
+                    debug!(" - {:?}", element);
+                    buf.push(element);
+                }
+
+                let tuple = Element::Tuple(buf);
+                self.directory_stack.push(DirectoryStackItem::Subspace(
+                    self.subspace_with_current(&tuple).unwrap(),
+                ));
+            }
 
             // Use the current directory for this operation.
             //
@@ -2269,7 +2292,26 @@ impl StackMachine {
             // subspace and store the result as [prefix]. Throw an error if the popped
             // array does not start with prefix. Otherwise, remove the prefix from the
             // popped array and push the result onto the stack.
-            DirectoryStripPrefix => unimplemented!(),
+            DirectoryStripPrefix => {
+                debug!("directory_strip_prefix stack: {:?}", self.stack);
+                let raw_prefix = self.pop_bytes().await;
+                let subspace_bytes_length =
+                    self.get_current_directory_subspace().unwrap().bytes().len();
+                if raw_prefix.len() != subspace_bytes_length {
+                    self.push_directory_err(
+                        &instr.code,
+                        number,
+                        DirectoryError::Version(String::from(
+                            "String does not start with raw prefix",
+                        )),
+                    );
+                } else {
+                    self.push(
+                        number,
+                        Element::Bytes(Bytes::from(raw_prefix[subspace_bytes_length..].to_owned())),
+                    );
+                }
+            }
         }
 
         if is_db && pending {

@@ -112,8 +112,6 @@ impl Directory for DirectorySubspace {
             return Err(DirectoryError::CannotMoveBetweenPartition);
         }
 
-        dbg!(&new_path, &self.path);
-
         if compare_slice_string(&new_path[..partition_length], &self.path) != Ordering::Equal {
             Err(DirectoryError::CannotMoveBetweenPartition)
         } else {
@@ -157,7 +155,6 @@ impl Directory for DirectorySubspace {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
-        dbg!(&path);
         self.directory
             .list(
                 trx,

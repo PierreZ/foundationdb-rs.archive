@@ -40,7 +40,6 @@ impl Node {
     /// `check_layer` is checking the layer, throwing `IncompatibleLayer` when
     /// the provided layer does not match the one provided.
     pub(crate) fn check_layer(&self, layer: Vec<u8>) -> Result<(), DirectoryError> {
-        dbg!(&self.layer, &layer);
         match &self.layer {
             None => Err(DirectoryError::IncompatibleLayer),
             Some(layer_bytes) => {
