@@ -1,6 +1,6 @@
 use crate::directory::directory_layer::DirectoryLayer;
 use crate::directory::error::DirectoryError;
-use crate::directory::{compare_slice_string, Directory};
+use crate::directory::{compare_slice, Directory};
 use crate::tuple::{PackResult, Subspace, TuplePack, TupleUnpack};
 use crate::Transaction;
 use async_trait::async_trait;
@@ -112,7 +112,7 @@ impl Directory for DirectorySubspace {
             return Err(DirectoryError::CannotMoveBetweenPartition);
         }
 
-        if compare_slice_string(&new_path[..partition_length], &self.path) != Ordering::Equal {
+        if compare_slice(&new_path[..partition_length], &self.path) != Ordering::Equal {
             Err(DirectoryError::CannotMoveBetweenPartition)
         } else {
             self.move_to(

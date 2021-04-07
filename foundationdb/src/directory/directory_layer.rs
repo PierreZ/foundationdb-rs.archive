@@ -6,7 +6,7 @@ use crate::tuple::{Subspace, TuplePack};
 use crate::{FdbResult, Transaction};
 
 use crate::directory::DirectorySubspace;
-use crate::directory::{compare_slice_string, Directory};
+use crate::directory::{compare_slice, Directory};
 use async_trait::async_trait;
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::cmp::Ordering;
@@ -120,7 +120,7 @@ impl Directory for DirectoryLayer {
         }
 
         match self
-            .find_or_create_node(trx, path.to_owned(), false, None)
+            .find_or_create_node(trx, path.to_owned(), false, None, None)
             .await
         {
             Ok(_node) => Ok(true),
@@ -157,7 +157,7 @@ impl Directory for DirectoryLayer {
             slice_end = new_path.len();
         }
 
-        if compare_slice_string(&old_path[..], &new_path[..slice_end]) == Ordering::Equal
+        if compare_slice(&old_path[..], &new_path[..slice_end]) == Ordering::Equal
             || old_path.is_empty()
             || new_path.is_empty()
         {
@@ -165,7 +165,7 @@ impl Directory for DirectoryLayer {
         }
 
         let old_node = self
-            .find_or_create_node(&trx, old_path.to_owned(), false, None)
+            .find_or_create_node(&trx, old_path.to_owned(), false, None, None)
             .await?;
 
         if self.exists(&trx, new_path.to_owned()).await? {
@@ -177,6 +177,7 @@ impl Directory for DirectoryLayer {
                 &trx,
                 Vec::from(&new_path.to_owned()[..new_path.len() - 1]),
                 true,
+                None,
                 None,
             )
             .await?;
@@ -190,7 +191,7 @@ impl Directory for DirectoryLayer {
         }
 
         // create new node
-        self.find_or_create_node(&trx, new_path.to_owned(), true, Some(prefix))
+        self.find_or_create_node(&trx, new_path.to_owned(), true, Some(prefix), None)
             .await?;
 
         let child_name = old_path.last().unwrap().to_owned();
@@ -205,7 +206,7 @@ impl Directory for DirectoryLayer {
     /// as well as all of their contents.
     async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
         let node = self
-            .find_or_create_node(trx, path.to_owned(), false, None)
+            .find_or_create_node(trx, path.to_owned(), false, None, None)
             .await?;
         node.remove_all(trx).await?;
         Ok(true)
@@ -219,7 +220,7 @@ impl Directory for DirectoryLayer {
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
         let node = self
-            .find_or_create_node(trx, path.to_owned(), false, None)
+            .find_or_create_node(trx, path.to_owned(), false, None, None)
             .await?;
         node.list(&trx).await
     }
@@ -259,7 +260,13 @@ impl DirectoryLayer {
         }
 
         match self
-            .find_or_create_node(&trx, path.to_owned(), allow_create, prefix.to_owned())
+            .find_or_create_node(
+                &trx,
+                path.to_owned(),
+                allow_create,
+                prefix.to_owned(),
+                layer.to_owned(),
+            )
             .await
         {
             Ok(node) => {
@@ -384,6 +391,7 @@ impl DirectoryLayer {
         path: Vec<String>,
         allow_creation: bool,
         prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
     ) -> Result<Node, DirectoryError> {
         let mut node = Node {
             layer: None,
@@ -448,6 +456,10 @@ impl DirectoryLayer {
 
             if new_node {
                 trx.set(key.bytes(), prefix.as_slice());
+            }
+
+            if i == last_path_index && layer.is_some() && new_node {
+                node.store_layer(&trx, layer.to_owned().unwrap().to_owned())?;
             }
         }
 

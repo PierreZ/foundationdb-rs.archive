@@ -70,7 +70,7 @@ pub trait Directory {
     fn get_layer(&self) -> Vec<u8>;
 }
 
-pub fn compare_slice_string(a: &[String], b: &[String]) -> cmp::Ordering {
+pub fn compare_slice<T: Ord>(a: &[T], b: &[T]) -> cmp::Ordering {
     for (ai, bi) in a.iter().zip(b.iter()) {
         match ai.cmp(&bi) {
             Ordering::Equal => continue,
