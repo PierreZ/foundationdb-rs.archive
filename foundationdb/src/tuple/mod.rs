@@ -5,7 +5,7 @@
 mod element;
 pub mod hca;
 mod pack;
-mod subspace;
+pub mod subspace;
 mod versionstamp;
 
 use std::borrow::Cow;

@@ -16,6 +16,9 @@ use std::io;
 /// The enumeration holding all possible errors from a Directory.
 #[derive(Debug)]
 pub enum DirectoryError {
+    CannotModifyRootDirectory,
+    DirectoryPrefixInUse,
+    DirectoryDoesNotExists,
     /// missing path.
     NoPathProvided,
     /// tried to create an already existing path.
@@ -43,6 +46,7 @@ pub enum DirectoryError {
     CannotMoveBetweenSubdirectory,
     /// the parent of the destination directory does not exist. Create it first
     CannotMoveMissingParent,
+    PrefixNotEmpty,
     IoError(io::Error),
     FdbError(error::FdbError),
     HcaError(HcaError),

@@ -1,241 +1,164 @@
-use crate::directory::error::DirectoryError;
-use crate::directory::node::Node;
-use crate::future::FdbSlice;
-use crate::tuple::hca::HighContentionAllocator;
-use crate::tuple::{Subspace, TuplePack};
-use crate::{FdbResult, Transaction};
-
-use crate::directory::DirectorySubspace;
-use crate::directory::{compare_slice, Directory};
-use async_trait::async_trait;
-use byteorder::{LittleEndian, WriteBytesExt};
 use std::cmp::Ordering;
 
-// TODO: useful?
-const _LAYER_VERSION: (u8, u8, u8) = (1, 0, 0);
+use async_recursion::async_recursion;
+use async_trait::async_trait;
+use byteorder::{LittleEndian, WriteBytesExt};
+
+use crate::directory::directory_partition::DirectoryPartition;
+use crate::directory::directory_subspace::DirectorySubspace;
+use crate::directory::error::DirectoryError;
+use crate::directory::node::Node;
+use crate::directory::{compare_slice, Directory, DirectoryOutput};
+use crate::future::{FdbKeyValue, FdbSlice, FdbValue, FdbValuesIter};
+use crate::tuple::hca::HighContentionAllocator;
+use crate::tuple::{Subspace, TuplePack};
+use crate::RangeOption;
+use crate::{FdbResult, Transaction};
+use futures::prelude::stream::{Iter, Next};
+use futures::stream::StreamExt;
+use futures::try_join;
+use futures::{join, TryStreamExt};
+use parking_lot::{FairMutex, RawMutex};
+use std::option::Option::Some;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+pub(crate) const DEFAULT_SUB_DIRS: i64 = 0;
 const MAJOR_VERSION: u32 = 1;
 const MINOR_VERSION: u32 = 0;
 const PATCH_VERSION: u32 = 0;
-const DEFAULT_NODE_PREFIX: &[u8] = b"\xFE";
+pub(crate) const DEFAULT_NODE_PREFIX: &[u8] = b"\xFE";
 const DEFAULT_HCA_PREFIX: &[u8] = b"hca";
-pub(crate) const DEFAULT_SUB_DIRS: i64 = 0;
+pub(crate) const PARTITION_LAYER: &[u8] = b"partition";
 
-/// An implementation of FoundationDB's directory that is compatible with other bindings.
-///
-///
-/// Directories are a recommended approach for administering applications. Each application should create or open at least one directory to manage its subspaces.
-///
-/// Directories are identified by hierarchical paths analogous to the paths in a Unix-like file system.
-/// A path is represented as a List of strings. Each directory has an associated subspace used to store its content.
-/// The layer maps each path to a short prefix used for the corresponding subspace.
-/// In effect, directories provide a level of indirection for access to subspaces.
 #[derive(Debug, Clone)]
 pub struct DirectoryLayer {
-    /// the subspace used to store the hierarchy of paths. Each path is composed of Nodes.
-    /// Default is `Subspace::all()`.
+    pub root_node: Subspace,
     pub node_subspace: Subspace,
-    /// the subspace used to actually store the data.
-    /// Default is `Subspace::from_bytes(b"\xFE")`
     pub content_subspace: Subspace,
-
-    /// The allocator used to generates i64 paths that will reduce keys's length.
-    /// Default HAC is using  `Subspace::from_bytes(b"hca")` as the subspace.
     pub allocator: HighContentionAllocator,
+    pub allow_manual_prefixes: bool,
 
-    pub allow_manual_prefix: bool,
-
-    pub path: Vec<String>,
+    pub(crate) path: Vec<String>,
 }
 
 impl Default for DirectoryLayer {
     /// creates a default Directory to use
     fn default() -> Self {
-        DirectoryLayer {
-            node_subspace: Subspace::from_bytes(DEFAULT_NODE_PREFIX),
-            content_subspace: Subspace::all(),
-            allocator: HighContentionAllocator::new(
-                Subspace::from_bytes(DEFAULT_NODE_PREFIX).subspace(&DEFAULT_HCA_PREFIX),
-            ),
-            allow_manual_prefix: false,
-            path: vec![],
-        }
-    }
-}
-
-#[async_trait]
-impl Directory for DirectoryLayer {
-    /// `create_or_open` opens the directory specified by path (relative to this
-    /// Directory), and returns the directory and its contents as a
-    /// Subspace. If the directory does not exist, it is created
-    /// (creating parent directories if necessary).
-    async fn create_or_open(
-        &self,
-        txn: &Transaction,
-        path: Vec<String>,
-        prefix: Option<Vec<u8>>,
-        layer: Option<Vec<u8>>,
-    ) -> Result<DirectorySubspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, prefix, layer, true, true)
-            .await
-    }
-
-    /// `create` creates a directory specified by path (relative to this
-    /// Directory), and returns the directory and its contents as a
-    /// Subspace (or ErrDirAlreadyExists if the directory already exists).
-    async fn create(
-        &self,
-        txn: &Transaction,
-        path: Vec<String>,
-        prefix: Option<Vec<u8>>,
-        layer: Option<Vec<u8>>,
-    ) -> Result<DirectorySubspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, prefix, layer, true, true)
-            .await
-    }
-
-    /// `open` opens the directory specified by path (relative to this Directory),
-    /// and returns the directory and its contents as a Subspace (or Err(DirNotExists)
-    /// error if the directory does not exist, or ErrParentDirDoesNotExist if one of the parent
-    /// directories in the path does not exist).
-    async fn open(
-        &self,
-        txn: &Transaction,
-        path: Vec<String>,
-        layer: Option<Vec<u8>>,
-    ) -> Result<DirectorySubspace, DirectoryError> {
-        self.create_or_open_internal(txn, path, None, layer, false, true)
-            .await
-    }
-
-    /// `exists` returns true if the directory at path (relative to the default root directory) exists, and false otherwise.
-    async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        match self.check_version(trx, false).await {
-            Ok(()) => {}
-            Err(e) => {
-                return match e {
-                    DirectoryError::MissingDirectory => Ok(false),
-                    _ => Err(e),
-                }
-            }
-        }
-
-        match self
-            .find_or_create_node(trx, path.to_owned(), false, None, None)
-            .await
-        {
-            Ok(_node) => Ok(true),
-            Err(err) => match err {
-                DirectoryError::PathDoesNotExists => Ok(false),
-                _ => Err(err),
-            },
-        }
-    }
-
-    async fn move_directory(
-        &self,
-        _trx: &Transaction,
-        _new_path: Vec<String>,
-    ) -> Result<DirectorySubspace, DirectoryError> {
-        Err(DirectoryError::CannotMoveRootDirectory)
-    }
-
-    /// `move_to` the directory from old_path to new_path(both relative to this
-    /// Directory), and returns the directory (at its new location) and its
-    /// contents as a Subspace. Move will return an error if a directory
-    /// does not exist at oldPath, a directory already exists at newPath, or the
-    /// parent directory of newPath does not exist.
-    async fn move_to(
-        &self,
-        trx: &Transaction,
-        old_path: Vec<String>,
-        new_path: Vec<String>,
-    ) -> Result<DirectorySubspace, DirectoryError> {
-        self.check_version(trx, false).await?;
-
-        let mut slice_end = old_path.len();
-        if slice_end > new_path.len() {
-            slice_end = new_path.len();
-        }
-
-        if compare_slice(&old_path[..], &new_path[..slice_end]) == Ordering::Equal
-            || old_path.is_empty()
-            || new_path.is_empty()
-        {
-            return Err(DirectoryError::CannotMoveBetweenSubdirectory);
-        }
-
-        let old_node = self
-            .find_or_create_node(&trx, old_path.to_owned(), false, None, None)
-            .await?;
-
-        if self.exists(&trx, new_path.to_owned()).await? {
-            return Err(DirectoryError::DirAlreadyExists);
-        }
-
-        let new_node_parent = self
-            .find_or_create_node(
-                &trx,
-                Vec::from(&new_path.to_owned()[..new_path.len() - 1]),
-                true,
-                None,
-                None,
-            )
-            .await?;
-
-        let content_subspace = old_node.content_subspace.clone().unwrap();
-
-        let prefix = self.node_subspace.unpack(content_subspace.bytes())?;
-
-        if new_node_parent.is_new_node {
-            return Err(DirectoryError::CannotMoveMissingParent);
-        }
-
-        // create new node
-        self.find_or_create_node(&trx, new_path.to_owned(), true, Some(prefix), None)
-            .await?;
-
-        let child_name = old_path.last().unwrap().to_owned();
-        new_node_parent.remove_child(&trx, child_name).await?;
-
-        return self
-            .contents_of_node(old_node.content_subspace, new_path, old_node.layer)
-            .await;
-    }
-
-    /// `remove` the subdirectory of this Directory located at `path` and all of its subdirectories,
-    /// as well as all of their contents.
-    async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        let node = self
-            .find_or_create_node(trx, path.to_owned(), false, None, None)
-            .await?;
-        node.remove_all(trx).await?;
-        Ok(true)
-    }
-
-    /// `list` returns the names of the immediate subdirectories of the default root directory as a slice of strings.
-    /// Each string is the name of the last component of a subdirectory's path.  
-    async fn list(
-        &self,
-        trx: &Transaction,
-        path: Vec<String>,
-    ) -> Result<Vec<String>, DirectoryError> {
-        let node = self
-            .find_or_create_node(trx, path.to_owned(), false, None, None)
-            .await?;
-        node.list(&trx).await
-    }
-
-    fn get_path(&self) -> Vec<String> {
-        self.path.clone()
-    }
-
-    fn get_layer(&self) -> Vec<u8> {
-        vec![]
+        Self::new(
+            Subspace::from_bytes(DEFAULT_NODE_PREFIX),
+            Subspace::all(),
+            false,
+        )
     }
 }
 
 impl DirectoryLayer {
+    pub fn new(
+        node_subspace: Subspace,
+        content_subspace: Subspace,
+        allow_manual_prefixes: bool,
+    ) -> Self {
+        let root_node = node_subspace.subspace(&node_subspace.bytes());
+
+        DirectoryLayer {
+            root_node: root_node.clone(),
+            node_subspace,
+            content_subspace,
+            allocator: HighContentionAllocator::new(root_node.subspace(&DEFAULT_HCA_PREFIX)),
+            allow_manual_prefixes,
+            path: vec![],
+        }
+    }
+
+    fn node_with_optional_prefix(&self, prefix: Option<FdbSlice>) -> Option<Subspace> {
+        match prefix {
+            None => None,
+            Some(fdb_slice) => Some(self.node_with_prefix(&(&*fdb_slice))),
+        }
+    }
+
+    fn node_with_prefix<T: TuplePack>(&self, prefix: &T) -> Subspace {
+        self.node_subspace.subspace(prefix)
+    }
+
+    async fn find(&self, trx: &Transaction, path: Vec<String>) -> Result<Node, DirectoryError> {
+        let mut node = Node {
+            subspace: Some(self.root_node.clone()),
+            current_path: vec![],
+            target_path: path.clone(),
+            layer: vec![],
+            loaded_metadata: false,
+        };
+
+        // walking through the provided path
+        for path_name in path.iter() {
+            node.current_path.push(path_name.clone());
+            let key = node
+                .subspace
+                .unwrap()
+                .subspace(&(DEFAULT_SUB_DIRS, path_name.to_owned()));
+
+            // finding the next node
+            let fdb_slice_value = trx.get(key.bytes(), false).await?;
+
+            node = Node {
+                subspace: self.node_with_optional_prefix(fdb_slice_value),
+                current_path: node.current_path.clone(),
+                target_path: path.clone(),
+                layer: vec![],
+                loaded_metadata: false,
+            };
+
+            node.load_metadata(&trx).await?;
+
+            if !node.exists() || node.layer.eq(PARTITION_LAYER) {
+                return Ok(node);
+            }
+        }
+
+        if !node.loaded_metadata {
+            node.load_metadata(&trx).await?;
+        }
+
+        Ok(node)
+    }
+
+    fn to_absolute_path(&self, sub_path: &[String]) -> Vec<String> {
+        let mut path: Vec<String> = Vec::with_capacity(self.path.len() + sub_path.len());
+
+        path.extend_from_slice(&self.path);
+        path.extend_from_slice(sub_path);
+
+        path
+    }
+
+    fn contents_of_node(
+        &self,
+        node: Subspace,
+        path: Vec<String>,
+        layer: Vec<u8>,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        let prefix: Vec<u8> = self.node_subspace.unpack(node.bytes())?;
+
+        println!("prefix: {:?}", &prefix);
+
+        if layer.eq(PARTITION_LAYER) {
+            Ok(DirectoryOutput::DirectoryPartition(
+                DirectoryPartition::new(self.to_absolute_path(&path), prefix, self.clone()),
+            ))
+        } else {
+            Ok(DirectoryOutput::DirectorySubspace(DirectorySubspace::new(
+                self.to_absolute_path(&path),
+                prefix,
+                self,
+                layer.to_owned(),
+            )))
+        }
+    }
+
     /// `create_or_open_internal` is the function used to open and/or create a directory.
+    #[async_recursion]
     async fn create_or_open_internal(
         &self,
         trx: &Transaction,
@@ -244,10 +167,10 @@ impl DirectoryLayer {
         layer: Option<Vec<u8>>,
         allow_create: bool,
         allow_open: bool,
-    ) -> Result<DirectorySubspace, DirectoryError> {
+    ) -> Result<DirectoryOutput, DirectoryError> {
         self.check_version(trx, allow_create).await?;
 
-        if prefix.is_some() && !self.allow_manual_prefix {
+        if prefix.is_some() && !self.allow_manual_prefixes {
             if self.path.is_empty() {
                 return Err(DirectoryError::PrefixNotAllowed);
             }
@@ -259,71 +182,200 @@ impl DirectoryLayer {
             return Err(DirectoryError::NoPathProvided);
         }
 
-        match self
-            .find_or_create_node(
-                &trx,
-                path.to_owned(),
-                allow_create,
-                prefix.to_owned(),
-                layer.to_owned(),
-            )
-            .await
-        {
-            Ok(node) => {
-                if !allow_open {
-                    return Err(DirectoryError::DirAlreadyExists);
-                }
+        let node = self.find(trx, path.to_owned()).await?;
 
-                match layer.to_owned() {
-                    None => {}
-                    Some(l) => {
-                        node.check_layer(l)?;
-                    }
-                }
-
-                let subspace = self.node_with_prefix(node.node_subspace.bytes().pack_to_vec());
-
-                self.contents_of_node(subspace, path.to_owned(), layer.to_owned())
-                    .await
+        if node.exists() {
+            // TODO true or false?
+            if node.is_in_partition(false) {
+                let sub_path = node.get_partition_subpath();
+                let dir_space =
+                    self.contents_of_node(node.subspace.unwrap(), node.current_path, node.layer)?;
+                dir_space
+                    .create_or_open(trx, sub_path.to_owned(), prefix, layer)
+                    .await?;
+                Ok(dir_space)
+            } else {
+                self.open_internal(layer, &node, allow_open).await
             }
-            Err(err) => Err(err),
+        } else {
+            self.create_internal(trx, path, layer, prefix, allow_create)
+                .await
         }
     }
 
-    fn node_with_prefix(&self, prefix: Vec<u8>) -> Option<Subspace> {
-        match prefix.len() {
-            0 => None,
-            _ => Some(self.node_subspace.subspace(&(prefix))),
-        }
-    }
-
-    // generate a DirectorySubspace
-    async fn contents_of_node(
+    async fn open_internal(
         &self,
-        subspace: Option<Subspace>,
+        layer: Option<Vec<u8>>,
+        node: &Node,
+        allow_open: bool,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        if !allow_open {
+            return Err(DirectoryError::DirAlreadyExists);
+        }
+
+        match layer.to_owned() {
+            None => {}
+            Some(l) => match compare_slice(&l, &node.layer) {
+                Ordering::Equal => {}
+                _ => {
+                    return Err(DirectoryError::IncompatibleLayer);
+                }
+            },
+        }
+
+        self.contents_of_node(
+            node.subspace.as_ref().unwrap().clone(),
+            node.target_path.to_owned(),
+            layer.unwrap_or(vec![]),
+        )
+    }
+
+    async fn create_internal(
+        &self,
+        trx: &Transaction,
         path: Vec<String>,
         layer: Option<Vec<u8>>,
-    ) -> Result<DirectorySubspace, DirectoryError> {
-        let subspace_bytes = match subspace {
-            None => vec![],
-            Some(s) => s.bytes().to_vec(),
-        };
-
-        let p = self.node_subspace.unpack::<Vec<u8>>(&subspace_bytes)?;
-
-        let mut new_path = self.path.to_owned();
-        for p in path {
-            new_path.push(p);
+        prefix: Option<Vec<u8>>,
+        allow_create: bool,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        if !allow_create {
+            return Err(DirectoryError::DirectoryDoesNotExists);
         }
 
-        let ss = Subspace::from_bytes(&*p);
+        let layer = layer.unwrap_or(vec![]);
 
-        let layer = match layer {
-            None => vec![],
-            Some(layer) => layer,
-        };
+        self.check_version(trx, allow_create).await?;
+        let new_prefix = self.get_prefix(trx, prefix.clone()).await?;
 
-        Ok(DirectorySubspace::new(ss, self.clone(), new_path, layer))
+        println!("new_prefix: {:?}", &new_prefix);
+
+        let is_prefix_free = self
+            .is_prefix_free(trx, new_prefix.to_owned(), !prefix.is_some())
+            .await?;
+
+        if !is_prefix_free {
+            return Err(DirectoryError::DirectoryPrefixInUse);
+        }
+
+        let parent_node = self.get_parent_node(trx, path.to_owned()).await?;
+        println!("parent_node: {:?}", &parent_node);
+        let node = self.node_with_prefix(&new_prefix);
+        println!("node: {:?}", &node);
+
+        let key = parent_node.subspace(&(DEFAULT_SUB_DIRS, path.last().unwrap()));
+
+        trx.set(&key.bytes(), &new_prefix);
+        trx.set(node.subspace(&b"layer".to_vec()).bytes(), &layer);
+        println!(
+            "writing layer in row {:?}",
+            node.subspace(&b"layer".to_vec()).bytes()
+        );
+
+        self.contents_of_node(node, path.to_owned(), layer.to_owned())
+    }
+
+    async fn get_parent_node(
+        &self,
+        trx: &Transaction,
+        path: Vec<String>,
+    ) -> Result<Subspace, DirectoryError> {
+        if path.len() > 1 {
+            let (_, list) = path.split_last().unwrap();
+
+            println!("searching for parent");
+
+            let parent = self
+                .create_or_open_internal(trx, list.to_vec(), None, None, true, true)
+                .await?;
+            println!("found a parent: {:?}", parent.bytes());
+            Ok(self.node_with_prefix(&parent.bytes().to_vec()))
+        } else {
+            Ok(self.root_node.clone())
+        }
+    }
+
+    async fn is_prefix_free(
+        &self,
+        trx: &Transaction,
+        prefix: Vec<u8>,
+        snapshot: bool,
+    ) -> Result<bool, DirectoryError> {
+        if prefix.is_empty() {
+            return Ok(false);
+        }
+
+        let node = self
+            .node_containing_key(trx, prefix.to_owned(), snapshot)
+            .await?;
+
+        if node.is_some() {
+            return Ok(false);
+        }
+
+        let range_option =
+            RangeOption::from(Subspace::from(self.node_subspace.pack(&prefix)).range());
+
+        let result = trx.get_range(&range_option, 1, false).await?;
+
+        Ok(result.is_empty())
+    }
+
+    async fn node_containing_key(
+        &self,
+        trx: &Transaction,
+        key: Vec<u8>,
+        snapshot: bool,
+    ) -> Result<Option<Subspace>, DirectoryError> {
+        if key.starts_with(self.node_subspace.bytes()) {
+            return Ok(Some(self.root_node.clone()));
+        }
+        // FIXME: got sometimes an error where the scan include another layer...
+        // https://github.com/apple/foundationdb/blob/master/bindings/flow/DirectoryLayer.actor.cpp#L186-L194
+        let (begin_range, _) = self.node_subspace.range();
+        let mut end_range = self.node_subspace.pack(&key);
+        // simulate keyAfter
+        end_range.push(0);
+
+        // checking range
+        let result = trx
+            .get_range(&RangeOption::from((begin_range, end_range)), 1, snapshot)
+            .await?;
+
+        if result.len() > 0 {
+            let previous_prefix: (String) =
+                self.node_subspace.unpack(result.get(0).unwrap().key())?;
+            if key.starts_with(previous_prefix.as_bytes()) {
+                return Ok(Some(self.node_with_prefix(&(previous_prefix))));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn get_prefix(
+        &self,
+        trx: &Transaction,
+        prefix: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, DirectoryError> {
+        match prefix {
+            None => {
+                // no prefix provided, allocating one
+                let allocator = self.allocator.allocate(trx).await?;
+                let subspace = self.content_subspace.subspace(&allocator);
+
+                // checking range
+                let result = trx
+                    .get_range(&RangeOption::from(subspace.range()), 1, false)
+                    .await?;
+
+                if !result.is_empty() {
+                    return Err(DirectoryError::PrefixNotEmpty);
+                }
+
+                Ok(subspace.bytes().to_vec())
+            }
+            Some(v) => Ok(v),
+        }
     }
 
     /// `check_version` is checking the Directory's version in FDB.
@@ -379,121 +431,324 @@ impl DirectoryLayer {
         value.write_u32::<LittleEndian>(MINOR_VERSION).unwrap();
         value.write_u32::<LittleEndian>(PATCH_VERSION).unwrap();
         let version_subspace: &[u8] = b"version";
-        let directory_version_key = self.get_root_node_subspace().subspace(&version_subspace);
+        let directory_version_key = self.root_node.subspace(&version_subspace);
         trx.set(directory_version_key.bytes(), &value);
 
         Ok(())
     }
 
-    async fn find_or_create_node(
-        &self,
-        trx: &Transaction,
-        path: Vec<String>,
-        allow_creation: bool,
-        prefix: Option<Vec<u8>>,
-        layer: Option<Vec<u8>>,
-    ) -> Result<Node, DirectoryError> {
-        let mut node = Node {
-            layer: None,
-            path: vec![],
-            node_subspace: self.get_root_node_subspace(),
-            content_subspace: None,
-            parent_node_reference: self.get_root_node_subspace(),
-            is_new_node: false,
-        };
-        let mut node_path = vec![];
-
-        let last_path_index = match path.len() {
-            0 => 0,
-            size => size - 1,
-        };
-
-        for (i, path_name) in path.iter().enumerate() {
-            node_path.push(path_name.to_owned());
-            let key = node
-                .node_subspace
-                .subspace(&(DEFAULT_SUB_DIRS, path_name.to_owned()));
-
-            let (prefix, new_node) = match trx.get(key.bytes(), false).await {
-                Ok(value) => match value {
-                    None => {
-                        if !allow_creation {
-                            return Err(DirectoryError::PathDoesNotExists);
-                        }
-
-                        // if we are on the last node and a prefix was provided,
-                        // using the provided prefix as the content_subspace instead of
-                        // generating one.
-                        if i == last_path_index && prefix.is_some() {
-                            (
-                                Subspace::from_bytes(&*prefix.clone().unwrap())
-                                    .bytes()
-                                    .to_vec(),
-                                true,
-                            )
-                        } else {
-                            // creating the subspace for this not-existing node using the allocator
-                            let allocator = self.allocator.allocate(trx).await?;
-                            let subspace = self.content_subspace.subspace(&allocator);
-                            (subspace.bytes().to_vec(), true)
-                        }
-                    }
-                    Some(fdb_slice) => ((&*fdb_slice).to_vec(), false),
-                },
-                Err(err) => return Err(DirectoryError::FdbError(err)),
-            };
-
-            node = Node {
-                path: node_path.clone(),
-                layer: None,
-                node_subspace: self.node_subspace.subspace(&prefix.as_slice()),
-                content_subspace: Some(Subspace::from_bytes(&prefix.as_slice())),
-                parent_node_reference: key.to_owned(),
-                is_new_node: new_node,
-            };
-
-            node.retrieve_layer(&trx).await?;
-
-            if new_node {
-                trx.set(key.bytes(), prefix.as_slice());
-            }
-
-            if i == last_path_index && layer.is_some() && new_node {
-                node.store_layer(&trx, layer.to_owned().unwrap().to_owned())?;
-            }
-        }
-
-        Ok(node)
-    }
-
-    fn get_root_node_subspace(&self) -> Subspace {
-        return self
-            .node_subspace
-            .subspace::<&[u8]>(&self.node_subspace.bytes());
-    }
-
     async fn get_version_value(&self, trx: &Transaction) -> FdbResult<Option<FdbSlice>> {
         let version_subspace: &[u8] = b"version";
-        let version_key = self.get_root_node_subspace().subspace(&version_subspace);
+        let version_key = self.root_node.subspace(&version_subspace);
         trx.get(version_key.bytes(), false).await
     }
 
-    // TODO: check that we have the same behavior than the Go's bindings:
-    // func (dl directoryLayer) partitionSubpath(lpath, rpath []string) []string {
-    // 	r := make([]string, len(lpath)-len(dl.path)+len(rpath))
-    // 	copy(r, lpath[len(dl.path):])
-    // 	copy(r[len(lpath)-len(dl.path):], rpath)
-    // 	return r
-    // }
-    pub(crate) fn partition_subpath(
+    async fn exists_internal(
         &self,
-        left_path: Vec<String>,
-        right_path: Vec<String>,
-    ) -> Vec<String> {
-        let mut r: Vec<String> = vec![];
-        let extract_left = &left_path[self.path.len()..];
-        r.extend_from_slice(extract_left);
-        r.extend_from_slice(right_path.as_slice());
-        r
+        trx: &Transaction,
+        path: Vec<String>,
+    ) -> Result<bool, DirectoryError> {
+        self.check_version(trx, false).await?;
+
+        if path.is_empty() {
+            return Err(DirectoryError::NoPathProvided);
+        }
+
+        let node = self.find(trx, path.to_owned()).await?;
+
+        if !node.exists() {
+            return Ok(false);
+        }
+
+        if node.is_in_partition(false) {
+            let directory_partition = self.contents_of_node(
+                node.clone().subspace.unwrap(),
+                node.current_path.to_owned(),
+                node.layer.to_owned(),
+            )?;
+            return directory_partition
+                .exists(trx, node.to_owned().get_partition_subpath())
+                .await;
+        }
+
+        Ok(true)
+    }
+
+    async fn list_internal(
+        &self,
+        trx: &Transaction,
+        path: Vec<String>,
+    ) -> Result<Vec<String>, DirectoryError> {
+        self.check_version(trx, false).await?;
+
+        let node = self.find(trx, path.to_owned()).await?;
+        if !node.exists() {
+            return Err(DirectoryError::PathDoesNotExists);
+        }
+        if node.is_in_partition(true) {
+            let directory_partition = self.contents_of_node(
+                node.clone().subspace.unwrap(),
+                node.current_path.to_owned(),
+                node.layer.to_owned(),
+            )?;
+            return directory_partition
+                .list(trx, node.get_partition_subpath())
+                .await;
+        }
+
+        Ok(node.list_sub_folders(trx).await?)
+    }
+
+    async fn move_to_internal(
+        &self,
+        trx: &Transaction,
+        old_path: Vec<String>,
+        new_path: Vec<String>,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        self.check_version(trx, true).await?;
+
+        if old_path.len() <= new_path.len() {
+            if compare_slice(&old_path[..], &new_path[..old_path.len()]) == Ordering::Equal {
+                return Err(DirectoryError::CannotMoveBetweenSubdirectory);
+            }
+        }
+
+        let old_node = self.find(trx, old_path.to_owned()).await?;
+        let new_node = self.find(trx, new_path.to_owned()).await?;
+
+        if !old_node.exists() {
+            return Err(DirectoryError::PathDoesNotExists);
+        }
+
+        if old_node.is_in_partition(false) || new_node.is_in_partition(false) {
+            if !old_node.is_in_partition(false)
+                || !new_node.is_in_partition(false)
+                || old_node.current_path.eq(&new_node.current_path)
+            {
+                return Err(DirectoryError::CannotMoveBetweenPartition);
+            }
+
+            let directory_partition = self.contents_of_node(
+                new_node.clone().subspace.unwrap(),
+                new_node.current_path.to_owned(),
+                new_node.layer.to_owned(),
+            )?;
+
+            return directory_partition
+                .move_to(
+                    trx,
+                    old_node.get_partition_subpath(),
+                    new_node.get_partition_subpath(),
+                )
+                .await;
+        }
+
+        if new_node.exists() || new_path.is_empty() {
+            return Err(DirectoryError::DirAlreadyExists);
+        }
+
+        let parent_path = match new_path.split_last() {
+            None => vec![],
+            Some((_, elements)) => elements.to_vec(),
+        };
+
+        let parent_node = self.find(trx, parent_path).await?;
+        if !parent_node.exists() {
+            return Err(DirectoryError::ParentDirDoesNotExists);
+        }
+
+        let key = parent_node
+            .subspace
+            .unwrap()
+            .subspace(&(DEFAULT_SUB_DIRS, new_path.to_owned().last().unwrap()));
+        let value: Vec<u8> = self
+            .node_subspace
+            .unpack(old_node.subspace.clone().unwrap().bytes())?;
+        trx.set(&key.bytes(), &value);
+
+        self.remove_from_parent(trx, old_path.to_owned()).await?;
+
+        self.contents_of_node(
+            old_node.subspace.unwrap(),
+            new_path.to_owned(),
+            old_node.layer,
+        )
+    }
+
+    async fn remove_from_parent(
+        &self,
+        trx: &Transaction,
+        path: Vec<String>,
+    ) -> Result<(), DirectoryError> {
+        let (last_element, parent_path) = match path.split_last() {
+            None => return Err(DirectoryError::BadDestinationDirectory),
+            Some((last, elements)) => (last.clone(), elements.to_vec()),
+        };
+
+        let parent_node = self.find(trx, parent_path).await?;
+        match parent_node.subspace {
+            None => {}
+            Some(subspace) => {
+                let key = subspace.subspace(&(DEFAULT_SUB_DIRS, last_element));
+                trx.clear(&key.bytes());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn remove_internal(
+        &self,
+        trx: &Transaction,
+        path: Vec<String>,
+        fail_on_nonexistent: bool,
+    ) -> Result<bool, DirectoryError> {
+        self.check_version(trx, true).await?;
+
+        if path.is_empty() {
+            return Err(DirectoryError::CannotModifyRootDirectory);
+        }
+
+        let node = self.find(&trx, path.to_owned()).await?;
+        if !node.exists() {
+            return if fail_on_nonexistent {
+                Err(DirectoryError::DirectoryDoesNotExists)
+            } else {
+                Ok(false)
+            };
+        }
+
+        if node.is_in_partition(false) {
+            return self
+                .remove_internal(trx, node.get_partition_subpath(), fail_on_nonexistent)
+                .await;
+        }
+
+        try_join!(
+            self.remove_recursive(trx, node.subspace.unwrap().clone()),
+            self.remove_from_parent(trx, path.to_owned())
+        );
+
+        Ok(true)
+    }
+
+    #[async_recursion]
+    async fn remove_recursive(
+        &self,
+        trx: &Transaction,
+        node_sub: Subspace,
+    ) -> Result<(), DirectoryError> {
+        let sub_dir = node_sub.subspace(&(DEFAULT_SUB_DIRS));
+        let (mut begin, end) = sub_dir.range();
+
+        loop {
+            let range_option = RangeOption::from((begin.as_slice(), end.as_slice()));
+
+            let range = trx.get_range(&range_option, 1, false).await?;
+            let has_more = range.more();
+            let range: Arc<FairMutex<FdbValuesIter>> = Arc::new(FairMutex::new(range.into_iter()));
+
+            loop {
+                let value_row = match range.lock().next() {
+                    None => break,
+                    Some(next_key_value) => next_key_value.value().to_vec(),
+                };
+
+                let sub_node = self.node_with_prefix(&value_row);
+                self.remove_recursive(trx, sub_node).await?;
+            }
+
+            if !has_more {
+                break;
+            }
+        }
+
+        let mut node_prefix: Vec<u8> = self.node_subspace.unpack(node_sub.bytes())?;
+
+        // equivalent of strinc?
+        node_prefix.remove(node_prefix.len());
+
+        trx.clear_range(node_prefix.as_slice(), node_prefix.as_slice());
+        trx.clear_subspace_range(&node_sub);
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Directory for DirectoryLayer {
+    /// `create_or_open` opens the directory specified by path (relative to this
+    /// Directory), and returns the directory and its contents as a
+    /// Subspace. If the directory does not exist, it is created
+    /// (creating parent directories if necessary).
+    async fn create_or_open(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        self.create_or_open_internal(txn, path, prefix, layer, true, true)
+            .await
+    }
+
+    async fn create(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        prefix: Option<Vec<u8>>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        self.create_or_open_internal(txn, path, prefix, layer, true, false)
+            .await
+    }
+
+    async fn open(
+        &self,
+        txn: &Transaction,
+        path: Vec<String>,
+        layer: Option<Vec<u8>>,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        self.create_or_open_internal(txn, path, None, layer, false, true)
+            .await
+    }
+
+    async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
+        self.exists_internal(trx, path).await
+    }
+
+    async fn move_directory(
+        &self,
+        _trx: &Transaction,
+        _new_path: Vec<String>,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        Err(DirectoryError::CannotMoveRootDirectory)
+    }
+
+    /// `move_to` the directory from old_path to new_path(both relative to this
+    /// Directory), and returns the directory (at its new location) and its
+    /// contents as a Subspace. Move will return an error if a directory
+    /// does not exist at oldPath, a directory already exists at newPath, or the
+    /// parent directory of newPath does not exist.
+    async fn move_to(
+        &self,
+        trx: &Transaction,
+        old_path: Vec<String>,
+        new_path: Vec<String>,
+    ) -> Result<DirectoryOutput, DirectoryError> {
+        self.move_to_internal(trx, old_path, new_path).await
+    }
+
+    async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
+        self.remove_internal(trx, path.to_owned(), true).await
+    }
+
+    async fn list(
+        &self,
+        trx: &Transaction,
+        path: Vec<String>,
+    ) -> Result<Vec<String>, DirectoryError> {
+        self.list_internal(trx, path).await
     }
 }
