@@ -1,38 +1,57 @@
-use crate::directory::directory_layer::{DirectoryLayer, PARTITION_LAYER};
+use crate::directory::directory_layer::{DirectoryLayer, DEFAULT_NODE_PREFIX, PARTITION_LAYER};
 use crate::directory::directory_subspace::DirectorySubspace;
 use crate::directory::error::DirectoryError;
 use crate::directory::{Directory, DirectoryOutput};
-use crate::tuple::Subspace;
+use crate::tuple::{Subspace, TuplePack};
 use crate::Transaction;
 use async_trait::async_trait;
 
+/// A `DirectoryPartition` is a DirectorySubspace whose prefix is preprended to all of its descendant
+/// directories's prefixes. It cannot be used as a Subspace. Instead, you must create at
+/// least one subdirectory to store content.
+#[derive(Debug, Clone)]
 pub struct DirectoryPartition {
-    directory_subspace: DirectorySubspace,
-    parent_directory_layer: DirectoryLayer,
+    pub(crate) directory_subspace: DirectorySubspace,
+    pub(crate) parent_directory_layer: DirectoryLayer,
 }
 
 impl DirectoryPartition {
+    // https://github.com/apple/foundationdb/blob/master/bindings/flow/DirectoryPartition.h#L34-L43
     pub fn new(path: Vec<String>, prefix: Vec<u8>, parent_directory_layer: DirectoryLayer) -> Self {
-        let mut node_subspace_bytes = prefix.to_vec();
+        let mut node_subspace_bytes = vec![];
         node_subspace_bytes.extend_from_slice(&prefix);
+        node_subspace_bytes.extend_from_slice(DEFAULT_NODE_PREFIX);
+
+        let new_directory_layer = DirectoryLayer::new(
+            Subspace::from_bytes(&node_subspace_bytes),
+            Subspace::from_bytes(prefix.clone().as_slice()),
+            false,
+        );
 
         let mut d = DirectoryPartition {
             directory_subspace: DirectorySubspace::new(
-                path,
-                prefix,
-                &DirectoryLayer::new(
-                    Subspace::from_bytes(&node_subspace_bytes),
-                    Subspace::from_bytes(prefix.as_slice()),
-                    false,
-                ),
+                path.clone(),
+                prefix.clone(),
+                &new_directory_layer,
                 Vec::from(PARTITION_LAYER),
             ),
             parent_directory_layer,
         };
 
+        // https://github.com/apple/foundationdb/blob/master/bindings/flow/DirectoryPartition.h#L42 ??
         d.parent_directory_layer.path = path.to_vec();
 
         d
+    }
+}
+
+impl DirectoryPartition {
+    pub fn get_path(&self) -> Vec<String> {
+        self.directory_subspace.get_path()
+    }
+
+    pub fn get_layer(&self) -> Vec<u8> {
+        String::from("partition").into_bytes()
     }
 }
 

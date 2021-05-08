@@ -5,6 +5,7 @@ use crate::tuple::{PackResult, Subspace, TuplePack, TupleUnpack};
 use crate::Transaction;
 use async_trait::async_trait;
 
+#[derive(Debug, Clone)]
 pub struct DirectorySubspace {
     directory_layer: DirectoryLayer,
     subspace: Subspace,
@@ -31,7 +32,7 @@ impl DirectorySubspace {
     fn get_partition_subpath(&self, path: Vec<String>) -> Vec<String> {
         let mut new_path = vec![];
 
-        new_path.extend_from_slice(&path[self.directory_layer.path.len()..]);
+        new_path.extend_from_slice(&self.path[self.directory_layer.path.len()..]);
         new_path.extend_from_slice(path.as_slice());
 
         new_path
@@ -39,24 +40,36 @@ impl DirectorySubspace {
 }
 
 impl DirectorySubspace {
-    fn subspace<T: TuplePack>(&self, t: &T) -> Subspace {
+    pub fn subspace<T: TuplePack>(&self, t: &T) -> Subspace {
         self.subspace.subspace(t)
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         self.subspace.bytes()
     }
 
-    fn pack<T: TuplePack>(&self, t: &T) -> Vec<u8> {
+    pub fn pack<T: TuplePack>(&self, t: &T) -> Vec<u8> {
         self.subspace.pack(t)
     }
 
-    fn unpack<'de, T: TupleUnpack<'de>>(&self, key: &'de [u8]) -> PackResult<T> {
+    pub fn unpack<'de, T: TupleUnpack<'de>>(&self, key: &'de [u8]) -> PackResult<T> {
         self.subspace.unpack(key)
     }
 
-    fn range(&self) -> (Vec<u8>, Vec<u8>) {
+    pub fn range(&self) -> (Vec<u8>, Vec<u8>) {
         self.subspace.range()
+    }
+
+    pub fn get_path(&self) -> Vec<String> {
+        self.path.clone()
+    }
+
+    pub fn get_layer(&self) -> Vec<u8> {
+        self.layer.clone()
+    }
+
+    pub fn is_start_of(&self, key: &[u8]) -> bool {
+        self.subspace.is_start_of(&key)
     }
 }
 
@@ -125,7 +138,7 @@ impl Directory for DirectorySubspace {
         }
 
         let mut new_relative_path = vec![];
-        new_relative_path.extend_from_slice(&new_relative_path[directory_layer_path.len()..]);
+        new_relative_path.extend_from_slice(&new_path[directory_layer_path.len()..]);
 
         self.directory_layer
             .move_to(

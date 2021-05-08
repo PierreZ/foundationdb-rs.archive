@@ -1,36 +1,34 @@
-use std::cmp::Ordering;
-
-use async_recursion::async_recursion;
-use async_trait::async_trait;
-use byteorder::{LittleEndian, WriteBytesExt};
-
 use crate::directory::directory_partition::DirectoryPartition;
 use crate::directory::directory_subspace::DirectorySubspace;
 use crate::directory::error::DirectoryError;
 use crate::directory::node::Node;
 use crate::directory::{compare_slice, Directory, DirectoryOutput};
-use crate::future::{FdbKeyValue, FdbSlice, FdbValue, FdbValuesIter};
+use crate::future::{FdbKeyValue, FdbSlice, FdbValues};
 use crate::tuple::hca::HighContentionAllocator;
-use crate::tuple::{Subspace, TuplePack};
-use crate::RangeOption;
+use crate::tuple::{unpack, Element, Subspace, TuplePack};
+use crate::{FdbError, RangeOption};
 use crate::{FdbResult, Transaction};
-use futures::prelude::stream::{Iter, Next};
-use futures::stream::StreamExt;
+use async_recursion::async_recursion;
+use async_trait::async_trait;
+use byteorder::{LittleEndian, WriteBytesExt};
 use futures::try_join;
-use futures::{join, TryStreamExt};
-use parking_lot::{FairMutex, RawMutex};
+use std::cmp::Ordering;
 use std::option::Option::Some;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub(crate) const DEFAULT_SUB_DIRS: i64 = 0;
 const MAJOR_VERSION: u32 = 1;
 const MINOR_VERSION: u32 = 0;
 const PATCH_VERSION: u32 = 0;
-pub(crate) const DEFAULT_NODE_PREFIX: &[u8] = b"\xFE";
+pub const DEFAULT_NODE_PREFIX: &[u8] = b"\xFE";
 const DEFAULT_HCA_PREFIX: &[u8] = b"hca";
 pub(crate) const PARTITION_LAYER: &[u8] = b"partition";
 
+/// Directories are identified by hierarchical paths analogous to the paths
+/// in a Unix-like file system. A path is represented as a List of strings.
+/// Each directory has an associated subspace used to store its content. The
+/// layer maps each path to a short prefix used for the corresponding
+/// subspace. In effect, directories provide a level of indirection for
+/// access to subspaces.
 #[derive(Debug, Clone)]
 pub struct DirectoryLayer {
     pub root_node: Subspace,
@@ -71,6 +69,10 @@ impl DirectoryLayer {
         }
     }
 
+    pub fn get_path(&self) -> Vec<String> {
+        self.path.clone()
+    }
+
     fn node_with_optional_prefix(&self, prefix: Option<FdbSlice>) -> Option<Subspace> {
         match prefix {
             None => None,
@@ -94,10 +96,13 @@ impl DirectoryLayer {
         // walking through the provided path
         for path_name in path.iter() {
             node.current_path.push(path_name.clone());
-            let key = node
-                .subspace
-                .unwrap()
-                .subspace(&(DEFAULT_SUB_DIRS, path_name.to_owned()));
+            let node_subspace = match node.subspace {
+                // unreachable because on first iteration, it is set to root_node,
+                // on other iteration, `node.exists` is checking for the subspace's value
+                None => unreachable!("node's subspace is not set"),
+                Some(s) => s,
+            };
+            let key = node_subspace.subspace(&(DEFAULT_SUB_DIRS, path_name.to_owned()));
 
             // finding the next node
             let fdb_slice_value = trx.get(key.bytes(), false).await?;
@@ -140,8 +145,6 @@ impl DirectoryLayer {
         layer: Vec<u8>,
     ) -> Result<DirectoryOutput, DirectoryError> {
         let prefix: Vec<u8> = self.node_subspace.unpack(node.bytes())?;
-
-        println!("prefix: {:?}", &prefix);
 
         if layer.eq(PARTITION_LAYER) {
             Ok(DirectoryOutput::DirectoryPartition(
@@ -188,8 +191,13 @@ impl DirectoryLayer {
             // TODO true or false?
             if node.is_in_partition(false) {
                 let sub_path = node.get_partition_subpath();
+                let subspace_node = match node.subspace {
+                    // not reachable because `self.find` is creating a node with a subspace,
+                    None => unreachable!("node's subspace is not set"),
+                    Some(s) => s,
+                };
                 let dir_space =
-                    self.contents_of_node(node.subspace.unwrap(), node.current_path, node.layer)?;
+                    self.contents_of_node(subspace_node, node.current_path, node.layer)?;
                 dir_space
                     .create_or_open(trx, sub_path.to_owned(), prefix, layer)
                     .await?;
@@ -223,10 +231,16 @@ impl DirectoryLayer {
             },
         }
 
+        let subspace_node = match node.to_owned().subspace {
+            // not reachable because `self.find` is creating a node with a subspace,
+            None => unreachable!("node's subspace is not set"),
+            Some(s) => s,
+        };
+
         self.contents_of_node(
-            node.subspace.as_ref().unwrap().clone(),
+            subspace_node.clone().subspace(&()),
             node.target_path.to_owned(),
-            layer.unwrap_or(vec![]),
+            node.layer.to_owned(),
         )
     }
 
@@ -247,8 +261,6 @@ impl DirectoryLayer {
         self.check_version(trx, allow_create).await?;
         let new_prefix = self.get_prefix(trx, prefix.clone()).await?;
 
-        println!("new_prefix: {:?}", &new_prefix);
-
         let is_prefix_free = self
             .is_prefix_free(trx, new_prefix.to_owned(), !prefix.is_some())
             .await?;
@@ -258,18 +270,12 @@ impl DirectoryLayer {
         }
 
         let parent_node = self.get_parent_node(trx, path.to_owned()).await?;
-        println!("parent_node: {:?}", &parent_node);
         let node = self.node_with_prefix(&new_prefix);
-        println!("node: {:?}", &node);
 
         let key = parent_node.subspace(&(DEFAULT_SUB_DIRS, path.last().unwrap()));
 
         trx.set(&key.bytes(), &new_prefix);
-        trx.set(node.subspace(&b"layer".to_vec()).bytes(), &layer);
-        println!(
-            "writing layer in row {:?}",
-            node.subspace(&b"layer".to_vec()).bytes()
-        );
+        trx.set(&node.pack(&(String::from("layer"))), &layer);
 
         self.contents_of_node(node, path.to_owned(), layer.to_owned())
     }
@@ -282,12 +288,9 @@ impl DirectoryLayer {
         if path.len() > 1 {
             let (_, list) = path.split_last().unwrap();
 
-            println!("searching for parent");
-
             let parent = self
                 .create_or_open_internal(trx, list.to_vec(), None, None, true, true)
                 .await?;
-            println!("found a parent: {:?}", parent.bytes());
             Ok(self.node_with_prefix(&parent.bytes().to_vec()))
         } else {
             Ok(self.root_node.clone())
@@ -329,26 +332,36 @@ impl DirectoryLayer {
         if key.starts_with(self.node_subspace.bytes()) {
             return Ok(Some(self.root_node.clone()));
         }
-        // FIXME: got sometimes an error where the scan include another layer...
-        // https://github.com/apple/foundationdb/blob/master/bindings/flow/DirectoryLayer.actor.cpp#L186-L194
-        let (begin_range, _) = self.node_subspace.range();
-        let mut end_range = self.node_subspace.pack(&key);
-        // simulate keyAfter
-        end_range.push(0);
+
+        let mut key_after = key.to_vec();
+        // pushing 0x00 to simulate keyAfter
+        key_after.push(0);
+
+        let range_end = self.node_subspace.pack(&key_after);
+
+        let mut range_option = RangeOption::from((self.node_subspace.range().0, range_end));
+        range_option.reverse = true;
+        range_option.limit = Some(1);
 
         // checking range
-        let result = trx
-            .get_range(&RangeOption::from((begin_range, end_range)), 1, snapshot)
-            .await?;
+        let fdb_values = trx.get_range(&range_option, 1, snapshot).await?;
 
-        if result.len() > 0 {
-            let previous_prefix: (String) =
-                self.node_subspace.unpack(result.get(0).unwrap().key())?;
-            if key.starts_with(previous_prefix.as_bytes()) {
-                return Ok(Some(self.node_with_prefix(&(previous_prefix))));
+        match fdb_values.get(0) {
+            None => {}
+            Some(fdb_key_value) => {
+                let previous_prefix: Vec<Element> =
+                    self.node_subspace.unpack(fdb_key_value.key())?;
+                match previous_prefix.get(0) {
+                    Some(Element::Bytes(b)) => {
+                        let previous_prefix = b.to_vec();
+                        if key.starts_with(&previous_prefix) {
+                            return Ok(Some(self.node_with_prefix(&previous_prefix)));
+                        };
+                    }
+                    _ => {}
+                };
             }
         }
-
         Ok(None)
     }
 
@@ -390,7 +403,7 @@ impl DirectoryLayer {
                 if allow_creation {
                     self.initialize_directory(trx).await
                 } else {
-                    Err(DirectoryError::MissingDirectory)
+                    return Ok(());
                 }
             }
             Some(versions) => {
@@ -440,6 +453,7 @@ impl DirectoryLayer {
     async fn get_version_value(&self, trx: &Transaction) -> FdbResult<Option<FdbSlice>> {
         let version_subspace: &[u8] = b"version";
         let version_key = self.root_node.subspace(&version_subspace);
+
         trx.get(version_key.bytes(), false).await
     }
 
@@ -450,19 +464,23 @@ impl DirectoryLayer {
     ) -> Result<bool, DirectoryError> {
         self.check_version(trx, false).await?;
 
-        if path.is_empty() {
-            return Err(DirectoryError::NoPathProvided);
-        }
-
         let node = self.find(trx, path.to_owned()).await?;
+
+        dbg!(&node);
 
         if !node.exists() {
             return Ok(false);
         }
 
         if node.is_in_partition(false) {
+            let subspace_node = match node.subspace {
+                // not reachable because `self.find` is creating a node with a subspace,
+                None => unreachable!("node's subspace is not set"),
+                Some(ref s) => s.clone(),
+            };
+
             let directory_partition = self.contents_of_node(
-                node.clone().subspace.unwrap(),
+                subspace_node,
                 node.current_path.to_owned(),
                 node.layer.to_owned(),
             )?;
@@ -485,9 +503,15 @@ impl DirectoryLayer {
         if !node.exists() {
             return Err(DirectoryError::PathDoesNotExists);
         }
-        if node.is_in_partition(true) {
+        if node.is_in_partition(false) {
+            let subspace_node = match node.subspace {
+                // not reachable because `self.find` is creating a node with a subspace.
+                None => unreachable!("node's subspace is not set"),
+                Some(ref s) => s.clone(),
+            };
+
             let directory_partition = self.contents_of_node(
-                node.clone().subspace.unwrap(),
+                subspace_node,
                 node.current_path.to_owned(),
                 node.layer.to_owned(),
             )?;
@@ -528,8 +552,14 @@ impl DirectoryLayer {
                 return Err(DirectoryError::CannotMoveBetweenPartition);
             }
 
+            let subspace_new_node = match new_node.subspace {
+                // not reachable because `self.find` is creating a node with a subspace,
+                None => unreachable!("node's subspace is not set"),
+                Some(ref s) => s.clone(),
+            };
+
             let directory_partition = self.contents_of_node(
-                new_node.clone().subspace.unwrap(),
+                subspace_new_node,
                 new_node.current_path.to_owned(),
                 new_node.layer.to_owned(),
             )?;
@@ -557,10 +587,14 @@ impl DirectoryLayer {
             return Err(DirectoryError::ParentDirDoesNotExists);
         }
 
-        let key = parent_node
-            .subspace
-            .unwrap()
-            .subspace(&(DEFAULT_SUB_DIRS, new_path.to_owned().last().unwrap()));
+        let subspace_parent_node = match parent_node.subspace {
+            // not reachable because `self.find` is creating a node with a subspace,
+            None => unreachable!("node's subspace is not set"),
+            Some(ref s) => s.clone(),
+        };
+
+        let key =
+            subspace_parent_node.subspace(&(DEFAULT_SUB_DIRS, new_path.to_owned().last().unwrap()));
         let value: Vec<u8> = self
             .node_subspace
             .unpack(old_node.subspace.clone().unwrap().bytes())?;
@@ -589,8 +623,8 @@ impl DirectoryLayer {
         match parent_node.subspace {
             None => {}
             Some(subspace) => {
-                let key = subspace.subspace(&(DEFAULT_SUB_DIRS, last_element));
-                trx.clear(&key.bytes());
+                let key = subspace.pack(&(DEFAULT_SUB_DIRS, last_element));
+                trx.clear(&key);
             }
         }
 
@@ -625,10 +659,9 @@ impl DirectoryLayer {
                 .await;
         }
 
-        try_join!(
-            self.remove_recursive(trx, node.subspace.unwrap().clone()),
-            self.remove_from_parent(trx, path.to_owned())
-        );
+        self.remove_recursive(trx, node.subspace.unwrap().clone())
+            .await?;
+        self.remove_from_parent(trx, path.to_owned()).await?;
 
         Ok(true)
     }
@@ -645,18 +678,14 @@ impl DirectoryLayer {
         loop {
             let range_option = RangeOption::from((begin.as_slice(), end.as_slice()));
 
-            let range = trx.get_range(&range_option, 1, false).await?;
+            let range = trx.get_range(&range_option, 1024, false).await?;
             let has_more = range.more();
-            let range: Arc<FairMutex<FdbValuesIter>> = Arc::new(FairMutex::new(range.into_iter()));
 
-            loop {
-                let value_row = match range.lock().next() {
-                    None => break,
-                    Some(next_key_value) => next_key_value.value().to_vec(),
-                };
-
-                let sub_node = self.node_with_prefix(&value_row);
+            for row_key in range {
+                let sub_node = self.node_with_prefix(&row_key.value());
                 self.remove_recursive(trx, sub_node).await?;
+                begin = row_key.key().pack_to_vec();
+                begin.push(0);
             }
 
             if !has_more {
@@ -667,7 +696,7 @@ impl DirectoryLayer {
         let mut node_prefix: Vec<u8> = self.node_subspace.unpack(node_sub.bytes())?;
 
         // equivalent of strinc?
-        node_prefix.remove(node_prefix.len());
+        node_prefix.remove(node_prefix.len() - 1);
 
         trx.clear_range(node_prefix.as_slice(), node_prefix.as_slice());
         trx.clear_subspace_range(&node_sub);

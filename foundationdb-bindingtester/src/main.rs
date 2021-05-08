@@ -38,7 +38,7 @@ use crate::fdb::options::{MutationType, StreamingMode};
 use foundationdb::directory::directory_layer::DirectoryLayer;
 use foundationdb::directory::directory_subspace::DirectorySubspace;
 use foundationdb::directory::error::DirectoryError;
-use foundationdb::directory::Directory;
+use foundationdb::directory::{Directory, DirectoryOutput};
 use foundationdb::tuple::{PackResult, TupleUnpack};
 
 use tuple::VersionstampOffset;
@@ -107,7 +107,7 @@ impl std::fmt::Debug for Instr {
 #[derive(Debug)]
 enum DirectoryStackItem {
     Directory(DirectoryLayer),
-    DirectorySubspace(DirectorySubspace),
+    DirectoryOutput(DirectoryOutput),
     Subspace(Subspace),
     Null,
 }
@@ -574,9 +574,7 @@ impl StackMachine {
             threads: Vec::new(),
             trx_counter: 0,
 
-            directory_stack: vec![DirectoryStackItem::Directory(DirectoryLayer {
-                ..Default::default()
-            })],
+            directory_stack: vec![DirectoryStackItem::Directory(DirectoryLayer::default())],
             directory_index: 0,
             error_index: 0,
         }
@@ -646,8 +644,24 @@ impl StackMachine {
         let element = self.pop_element().await;
         match element {
             Element::Bytes(v) => v,
-            Element::Nil => Bytes::from(vec![]),
             _ => panic!("bytes were expected, found {:?}", element),
+        }
+    }
+
+    async fn pop_optional_bytes(&mut self) -> Option<Vec<u8>> {
+        let element = self.pop_element().await;
+        match element {
+            Element::Bytes(v) => Some(v.to_vec()),
+            Element::Nil => None,
+            Element::String(_) => None,
+            Element::Tuple(_) => None,
+            Element::Int(_) => None,
+            Element::BigInt(_) => None,
+            Element::Float(_) => None,
+            Element::Double(_) => None,
+            Element::Bool(_) => None,
+            Element::Uuid(_) => None,
+            Element::Versionstamp(_) => None,
         }
     }
 
@@ -710,9 +724,8 @@ impl StackMachine {
     }
 
     fn push_directory_err(&mut self, code: &InstrCode, number: usize, err: DirectoryError) {
-        error!("DIRECTORY_ERROR during {:?}: {:?}", code, err);
-        let packed = pack(&(ERROR_DIRECTORY));
-        self.push(number, Element::Bytes(packed.into()));
+        error!("[{}] DIRECTORY_ERROR during {:?}: {:?}", number, code, err);
+        self.push(number, Element::Tuple(vec![ERROR_DIRECTORY.clone()]));
 
         if let InstrCode::DirectoryCreateSubspace
         | InstrCode::DirectoryCreateLayer
@@ -761,6 +774,7 @@ impl StackMachine {
         let is_db = instr.pop_database();
         let mut mutation = false;
         let mut pending = false;
+
         let (mut trx, trx_name) = if is_db {
             (
                 TransactionState::Transaction(self.check(number, db.create_trx())?),
@@ -1638,19 +1652,17 @@ impl StackMachine {
             // Create a subspace with path as the prefix tuple and the specified
             // raw_prefix. Append it to the directory list.
             DirectoryCreateSubspace => {
-                debug!("CreateSubspace stack: {:?}", self.stack);
                 let tuple_prefix = self.pop_string_tuple(1).await;
                 let raw_prefix = self.pop_bytes().await;
                 let subspace =
                     Subspace::from_bytes(&raw_prefix).subspace(tuple_prefix.get(0).unwrap());
                 debug!(
-                    "pushing {:?} at index {}",
+                    "pushing a new subspace {:?} at index {}",
                     &subspace,
                     self.directory_stack.len()
                 );
                 self.directory_stack
                     .push(DirectoryStackItem::Subspace(subspace));
-                debug!("directory_stack: {:?}", self.directory_stack);
             }
 
             // Pop 3 items off the stack as [index1, index2, allow_manual_prefixes]. Let
@@ -1663,22 +1675,15 @@ impl StackMachine {
             // If either of the two specified subspaces are null, then do not create a
             // directory layer and instead push null onto the directory list.
             DirectoryCreateLayer => {
-                debug!("CreateLayer stack: {:?}", self.stack);
                 let index_node_subspace = self.pop_usize().await;
                 let index_content_subspace = self.pop_usize().await;
-                let allow_manual_prefix = self.pop_i64().await == 1;
-
-                debug!(
-                    "node_subspace:{:?}, content_subspace={:?}",
-                    self.directory_stack.get(index_node_subspace),
-                    self.directory_stack.get(index_content_subspace)
-                );
+                let allow_manual_prefixes = self.pop_i64().await == 1;
 
                 let node_subspace = self.directory_stack.get(index_node_subspace);
                 let content_subspace = self.directory_stack.get(index_content_subspace);
 
                 if node_subspace.is_none() || content_subspace.is_none() {
-                    debug!(
+                    error!(
                         "pushing null on the directory list: {}, {}",
                         node_subspace.is_some(),
                         content_subspace.is_some()
@@ -1698,12 +1703,11 @@ impl StackMachine {
                     debug!("pushed a directory at index {}", self.directory_stack.len());
 
                     self.directory_stack
-                        .push(DirectoryStackItem::Directory(DirectoryLayer {
+                        .push(DirectoryStackItem::Directory(DirectoryLayer::new(
                             node_subspace,
                             content_subspace,
-                            allow_manual_prefix,
-                            ..Default::default()
-                        }));
+                            allow_manual_prefixes,
+                        )));
                 }
             }
 
@@ -1712,34 +1716,32 @@ impl StackMachine {
             // and prefix. If either of layer or prefix is null, use the default value for
             // that parameter (layer='', prefix=null).
             DirectoryCreate => {
-                debug!("Create stack: {:?}", self.stack);
-
                 let path = self.pop_string_tuple(1).await;
-                let bytes_layer = self.pop_bytes().await;
-                let bytes_prefix = self.pop_bytes().await;
-
-                let layer = if bytes_layer.is_empty() {
-                    None
-                } else {
-                    Some(bytes_layer.to_vec())
-                };
-
-                let prefix = if bytes_prefix.is_empty() {
-                    None
-                } else {
-                    Some(bytes_prefix.to_vec())
-                };
+                let layer = self.pop_optional_bytes().await;
+                let prefix = self.pop_optional_bytes().await;
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
+
+                debug!(
+                    "creating path {:?} with layer {:?} and prefix {:?} using directory at index {}",
+                    path.get(0).unwrap(),
+                    &layer,
+                    &prefix,
+                    self.directory_index,
+                );
 
                 match directory
                     .create(
@@ -1752,12 +1754,15 @@ impl StackMachine {
                 {
                     Ok(directory_subspace) => {
                         debug!(
-                            "pushing created {:?} at index {}",
-                            &directory_subspace,
+                            "pushing DirectoryOutput at index {}",
                             self.directory_stack.len()
                         );
                         self.directory_stack
-                            .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
+                            .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
+                        if is_db {
+                            println!("commiting local trx");
+                            local_trx.commit().await.expect("could not commit");
+                        }
                     }
                     Err(e) => {
                         self.push_directory_err(&instr.code, number, e);
@@ -1765,9 +1770,10 @@ impl StackMachine {
                 };
             }
 
+            // Pop 1 tuple off the stack as [path]. Pop 1 additional item as [layer]. Open
+            // a directory with the specified path and layer. If layer is null, use the
+            // default value (layer='').
             DirectoryOpen => {
-                debug!("DirectoryOpen stack: {:?}", self.stack);
-
                 let path = self.pop_string_tuple(1).await;
                 let bytes_layer = self.pop_bytes().await;
 
@@ -1778,15 +1784,26 @@ impl StackMachine {
                 };
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
+
+                debug!(
+                    "opening path {:?} with layer {:?} with index {}",
+                    path.get(0).unwrap(),
+                    &layer,
+                    self.directory_index
+                );
 
                 match directory
                     .open(txn, (*path.get(0).unwrap().to_owned()).to_vec(), layer)
@@ -1794,12 +1811,16 @@ impl StackMachine {
                 {
                     Ok(directory_subspace) => {
                         debug!(
-                            "pushing newly opened {:?} at index {}",
-                            &directory_subspace,
+                            "pushing newly opened DirectoryOutput at index {}",
                             self.directory_stack.len()
                         );
                         self.directory_stack
-                            .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
+                            .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
+
+                        if is_db {
+                            println!("commiting local trx");
+                            local_trx.commit().await.expect("could not commit");
+                        }
                     }
                     Err(e) => {
                         self.push_directory_err(&instr.code, number, e);
@@ -1813,8 +1834,6 @@ impl StackMachine {
             // a directory with the specified path and layer. If layer is null, use the
             // default value (layer='').
             DirectoryCreateOrOpen => {
-                debug!("CreateOrOpen stack: {:?}", self.stack);
-
                 let path = self.pop_string_tuple(1).await;
                 let bytes_layer = self.pop_bytes().await;
 
@@ -1825,16 +1844,26 @@ impl StackMachine {
                 };
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
 
+                debug!(
+                    "create_or_open path {:?} with layer {:?} with index {}",
+                    path.get(0).unwrap(),
+                    &layer,
+                    self.directory_index
+                );
                 match directory
                     .create_or_open(
                         txn,
@@ -1851,7 +1880,11 @@ impl StackMachine {
                             self.directory_stack.len()
                         );
                         self.directory_stack
-                            .push(DirectoryStackItem::DirectorySubspace(directory_subspace));
+                            .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
+                        if is_db {
+                            println!("commiting local trx");
+                            local_trx.commit().await.expect("could not commit");
+                        }
                     }
                     Err(e) => self.push_directory_err(&instr.code, number, e),
                 };
@@ -1862,27 +1895,25 @@ impl StackMachine {
             // (as the result of a previous error), set the directory list index to the
             // error index.
             DirectoryChange => {
-                debug!("Change stack: {:?}", self.stack);
-
                 self.directory_index = self.pop_usize().await;
                 debug!("setting directory_index to {}", self.directory_index);
                 match self.directory_stack.get(self.directory_index) {
                     None => {
                         self.directory_index = self.error_index;
                         debug!(
-                            "setting directory_index to error index {}",
+                            "setting directory_index to error index {}: no directory found",
                             self.directory_index
                         );
                     }
                     Some(d) => match d {
-                        DirectoryStackItem::Directory(_) => {}
-                        _ => {
+                        DirectoryStackItem::Null => {
                             self.directory_index = self.error_index;
                             debug!(
-                                "setting directory_index to error index {}",
+                                "setting directory_index to error index {}: because it is Null",
                                 self.directory_index
                             );
                         }
+                        _ => {}
                     },
                 }
             }
@@ -1890,7 +1921,6 @@ impl StackMachine {
             // Pop the top item off the stack as [error_index]. Set the current error index
             // to error_index.
             DirectorySetErrorIndex => {
-                debug!("SetErrorIndex stack: {:?}", self.stack);
                 self.error_index = self.pop_usize().await;
             }
 
@@ -1899,22 +1929,29 @@ impl StackMachine {
             // Pop 2 tuples off the stack as [old_path, new_path]. Call move with the
             // specified old_path and new_path. Append the result onto the directory list.
             DirectoryMove => {
-                debug!("Move stack: {:?}", self.stack);
-
                 let paths = self.pop_string_tuple(2).await;
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
 
-                debug!("starting");
+                debug!(
+                    "moving {:?} to {:?} using directory at index {}",
+                    paths.get(0).unwrap(),
+                    paths.get(1).unwrap(),
+                    self.directory_index
+                );
 
                 match directory
                     .move_to(
@@ -1931,7 +1968,11 @@ impl StackMachine {
                             self.directory_stack.len()
                         );
                         self.directory_stack
-                            .push(DirectoryStackItem::DirectorySubspace(s));
+                            .push(DirectoryStackItem::DirectoryOutput(s));
+                        if is_db {
+                            println!("commiting local trx");
+                            local_trx.commit().await.expect("could not commit");
+                        }
                     }
                     Err(e) => {
                         self.push_directory_err(&instr.code, number, e);
@@ -1945,20 +1986,27 @@ impl StackMachine {
             // Pop 1 tuple off the stack as [new_absolute_path]. Call moveTo with the
             // specified new_absolute_path. Append the result onto the directory list.
             DirectoryMoveTo => {
-                debug!("MoveTo stack: {:?}", self.stack);
-
                 let paths = self.pop_string_tuple(1).await;
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
+
+                debug!(
+                    "moving directory {:?} to {:?}",
+                    self.directory_index, &paths
+                );
 
                 match directory
                     .move_directory(txn, (*paths.get(0).unwrap().to_vec()).to_owned())
@@ -1971,7 +2019,11 @@ impl StackMachine {
                             self.directory_stack.len()
                         );
                         self.directory_stack
-                            .push(DirectoryStackItem::DirectorySubspace(s));
+                            .push(DirectoryStackItem::DirectoryOutput(s));
+                        if is_db {
+                            println!("commiting");
+                            local_trx.commit().await.expect("could not commit");
+                        }
                     }
                     Err(e) => {
                         self.push_directory_err(&instr.code, number, e);
@@ -1985,24 +2037,36 @@ impl StackMachine {
             // tuple off the stack as [path]. Call remove_if_exits, passing it path if one
             // was popped.
             DirectoryRemove => {
-                debug!("Remove stack: {:?}", self.stack);
                 let count = self.pop_usize().await;
                 let paths = self.pop_string_tuple(count).await;
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
 
                 let paths = paths.get(0).expect("could not retrieve a path");
+                info!(
+                    "removing path {:?} using directory at index {}",
+                    paths, self.directory_index
+                );
                 match directory.remove(txn, paths.to_owned()).await {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if is_db {
+                            info!("toto commiting local trx");
+                            local_trx.commit().await.expect("could not commit");
+                        }
+                    }
                     Err(e) => {
                         self.push_directory_err(&instr.code, number, e);
                     }
@@ -2015,32 +2079,42 @@ impl StackMachine {
             // tuple off the stack as [path]. Call remove_if_exits, passing it path if one
             // was popped.
             DirectoryRemoveIfExists => {
-                debug!("RemoveIfExists stack: {:?}", self.stack);
                 let count = self.pop_usize().await;
                 let paths = self.pop_string_tuple(count).await;
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
 
                 let paths = paths.get(0).expect("could not retrieve a path");
-                if directory
-                    .exists(txn, paths.to_owned())
-                    .await
-                    .expect("could not check of existence")
-                {
-                    directory
-                        .remove(txn, paths.to_owned())
-                        .await
-                        .expect("could not remove path");
-                }
+                match directory.exists(txn, paths.to_owned()).await {
+                    Ok(exists) => {
+                        if exists {
+                            match directory.remove(txn, paths.to_owned()).await {
+                                Ok(_) => {
+                                    if is_db {
+                                        println!("commiting local trx");
+                                        local_trx.commit().await.expect("could not commit");
+                                    }
+                                }
+                                Err(err) => self.push_directory_err(&instr.code, number, err),
+                            }
+                        }
+                    }
+                    Err(err) => self.push_directory_err(&instr.code, number, err),
+                };
+                {}
             }
 
             // Use the current directory for this operation.
@@ -2050,32 +2124,51 @@ impl StackMachine {
             // Pack the resulting list of directories using the tuple layer and push the
             // packed string onto the stack.
             DirectoryList => {
-                debug!("List stack: {:?}", self.stack);
                 let count = self.pop_usize().await;
-                let paths = self.pop_string_tuple(count).await;
-
-                let directory = self
-                    .get_current_directory_layer()
-                    .expect("could not find a directory");
-
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
+                let paths = match count {
+                    1 => {
+                        let paths = self.pop_string_tuple(count).await;
+                        paths.get(0).expect("could not retrieve a path").clone()
                     }
+                    0 => vec![],
+                    _ => panic!(),
                 };
 
-                let paths = paths.get(0).expect("could not retrieve a path");
+                let directory = self
+                    .get_current_directory()
+                    .expect("could not find a directory");
+
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
+                };
 
                 match directory.list(txn, paths.to_vec()).await {
                     Ok(children) => {
                         let mut elements: Vec<Element> = vec![];
+                        debug!(
+                            "found {} items under path {:?} with directory at index {}:",
+                            children.len(),
+                            paths,
+                            self.directory_index
+                        );
                         for child in children {
+                            debug!("\t - {}", &child);
                             let element = Element::String(Cow::from(child));
                             elements.push(element);
                         }
                         let tuple = Element::Tuple(elements);
-                        self.push(number, Element::Bytes(pack(&tuple).into()));
+                        self.push(number, Element::Bytes(Bytes::from(tuple.pack_to_vec())));
+                        if is_db {
+                            println!("commiting local trx");
+                            local_trx.commit().await.expect("could not commit");
+                        }
                     }
                     Err(e) => {
                         self.push_directory_err(&instr.code, number, e);
@@ -2089,26 +2182,33 @@ impl StackMachine {
             // tuple off the stack as [path]. Call exists, passing it path if one
             // was popped. Push 1 onto the stack if the path exists and 0 if it does not.
             DirectoryExists => {
-                debug!("Exists stack: {:?}", self.stack);
                 let count = self.pop_usize().await;
 
                 let paths = self.pop_string_tuple(count).await;
 
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
-                let txn = match trx {
-                    TransactionState::Transaction(ref t) => t,
-                    _ => {
-                        panic!("could not find an active transaction");
-                    }
+                let local_trx = db.create_trx().unwrap();
+                let txn = match is_db {
+                    true => &local_trx,
+                    false => match trx {
+                        TransactionState::Transaction(ref t) => t,
+                        _ => {
+                            panic!("could not find an active transaction");
+                        }
+                    },
                 };
 
                 let paths = paths.get(0).expect("could not retrieve a path");
                 match directory.exists(txn, paths.to_owned()).await {
                     Ok(exists) => {
                         self.push(number, Element::Int(i64::from(exists)));
+                        if is_db {
+                            println!("commiting local trx");
+                            local_trx.commit().await.expect("could not commit");
+                        }
                     }
                     Err(e) => {
                         self.push_directory_err(&instr.code, number, e);
@@ -2131,10 +2231,17 @@ impl StackMachine {
                 }
 
                 let tuple = Element::Tuple(buf);
-                self.push(
-                    number,
-                    Element::Bytes(self.pack_with_current_subspace(&tuple).unwrap().into()),
-                );
+
+                match self.pack_with_current_subspace(&tuple) {
+                    None => self.push_directory_err(
+                        &instr.code,
+                        number,
+                        DirectoryError::PackError(crate::tuple::PackError::BadPrefix),
+                    ),
+                    Some(bytes) => {
+                        self.push(number, Element::Bytes(bytes.into()));
+                    }
+                }
             }
 
             // Use the current directory for this operation.
@@ -2143,11 +2250,12 @@ impl StackMachine {
             // onto the stack one item at a time.
             DirectoryUnpackKey => {
                 let data = self.pop_bytes().await;
+                let data = data.to_vec();
                 debug!("directory_unpack {:?}", data);
                 let data: Vec<Element> = self.unpack_with_current_subspace(&data).unwrap().unwrap();
                 for element in data {
                     debug!(" - {:?}", element);
-                    self.push(number, Element::Bytes(pack(&(element,)).into()));
+                    self.push(number, element.into_owned());
                 }
             }
 
@@ -2156,9 +2264,7 @@ impl StackMachine {
             // Pop 1 tuple off the stack as [tuple]. Create a range using tuple and push
             // range.begin and range.end onto the stack.
             DirectoryRange => {
-                debug!("directory_range stack: {:?}", self.stack);
                 let n: usize = self.pop_usize().await;
-                debug!("DirectoryRange {}", n);
                 let mut buf = Vec::new();
                 for _ in 0..n {
                     let element: Element = self.pop_element().await;
@@ -2166,11 +2272,24 @@ impl StackMachine {
                     buf.push(element);
                 }
 
-                let tuple = Element::Tuple(buf);
-                let subspace = self.subspace_with_current(&tuple).unwrap();
-                let (begin_range, end_range) = subspace.range();
-                self.push(number, Element::Bytes(begin_range.into()));
-                self.push(number, Element::Bytes(end_range.into()));
+                match self.get_current_item() {
+                    Some(DirectoryStackItem::DirectoryOutput(
+                        DirectoryOutput::DirectoryPartition(d),
+                    )) => {
+                        self.push_directory_err(
+                            &instr.code,
+                            number,
+                            DirectoryError::OperationNotAllowedOnDirectoryPartition,
+                        );
+                    }
+                    _ => {
+                        let tuple = Element::Tuple(buf);
+                        let subspace = self.subspace_with_current(&tuple).unwrap();
+                        let (begin_range, end_range) = subspace.range();
+                        self.push(number, Element::Bytes(begin_range.into()));
+                        self.push(number, Element::Bytes(end_range.into()));
+                    }
+                }
             }
 
             // Use the current directory for this operation.
@@ -2179,12 +2298,19 @@ impl StackMachine {
             // the specified key. Push 1 if it does and 0 if it doesn't.
             DirectoryContains => {
                 let raw_prefix = self.pop_bytes().await;
-                let b = self
-                    .get_current_directory_subspace()
-                    .unwrap()
-                    .subspace(&())
-                    .is_start_of(&raw_prefix);
-                self.push(number, Element::Bool(b));
+                let b = match self.get_current_item() {
+                    None => panic!("not found"),
+                    Some(DirectoryStackItem::Subspace(s)) => s.is_start_of(&raw_prefix.to_vec()),
+                    Some(DirectoryStackItem::DirectoryOutput(d)) => match d {
+                        DirectoryOutput::DirectorySubspace(s) => {
+                            s.is_start_of(&raw_prefix.to_vec())
+                        }
+                        _ => panic!("not a DirectorySubspace"),
+                    },
+                    _ => panic!("not found"),
+                };
+
+                self.push(number, Element::Int(b as i64));
             }
 
             // Use the current directory for this operation.
@@ -2192,7 +2318,6 @@ impl StackMachine {
             // Pop 1 tuple off the stack as [tuple]. Open the subspace of the current
             // directory specified by tuple and push it onto the directory list.
             DirectoryOpenSubspace => {
-                debug!("directory_open_subspace stack: {:?}", self.stack);
                 let n: usize = self.pop_usize().await;
                 debug!("DirectoryRange {}", n);
                 let mut buf = Vec::new();
@@ -2214,7 +2339,11 @@ impl StackMachine {
             // prefix + tuple.pack([dir_index]). Set key to be the result of calling
             // directory.key() in the current transaction.
             DirectoryLogSubspace => {
-                debug!("directory_log_subspace stack: {:?}", self.stack);
+                info!(
+                    "logging subspace {}/{}",
+                    self.directory_index,
+                    self.directory_stack.len()
+                );
                 let raw_prefix = self.pop_bytes().await;
                 let txn = match trx {
                     TransactionState::Transaction(ref t) => t,
@@ -2222,11 +2351,25 @@ impl StackMachine {
                         panic!("could not find an active transaction");
                     }
                 };
+                let key = Subspace::from_bytes(&*raw_prefix).pack(&self.directory_index);
 
-                let directory = self.get_current_directory_subspace().unwrap();
-                let key = pack(&(self.directory_index, &raw_prefix));
-                let value = directory.bytes();
+                let value = match self.directory_stack.get(self.directory_index) {
+                    None => panic!("nothing in the stack"),
+                    Some(DirectoryStackItem::Null) => panic!("Directory is NULL"),
+                    Some(DirectoryStackItem::Directory(_)) => {
+                        panic!("trying to get a subspace, got a Directory")
+                    }
+                    Some(DirectoryStackItem::DirectoryOutput(d)) => d.bytes(),
+                    Some(DirectoryStackItem::Subspace(s)) => s.bytes(),
+                };
+
                 txn.set(&key, &value);
+                println!(
+                    "logging subspace [{}] {:?}={:?}",
+                    self.directory_index,
+                    unpack::<Vec<Element>>(&key).unwrap(),
+                    &value
+                );
             }
 
             // Use the current directory for this operation.
@@ -2247,9 +2390,13 @@ impl StackMachine {
             // Where log_subspace[u<str>] is the subspace packed tuple containing only the
             // single specified unicode string <str>.
             DirectoryLogDirectory => {
-                debug!("directory_log_directory stack: {:?}", self.stack);
+                info!(
+                    "logging directory {}/{}",
+                    self.directory_index,
+                    self.directory_stack.len()
+                );
                 let directory = self
-                    .get_current_directory_layer()
+                    .get_current_directory()
                     .expect("could not find a directory");
 
                 let txn = match trx {
@@ -2263,27 +2410,66 @@ impl StackMachine {
                 let subspace = Subspace::from_bytes(&*raw_prefix).subspace(&(self.directory_index));
 
                 let key_path = subspace.pack(&(String::from("path")));
-                let value_path = pack(&directory.get_path());
+                let value_path = pack(&self.get_current_directory_path().unwrap());
 
                 let key_layer = subspace.pack(&(String::from("layer")));
-                let value_layer = pack(&directory.get_layer());
+                let value_layer = pack(&self.get_current_directory_layer().unwrap());
 
-                let exists = directory.exists(&txn, vec![]).await.unwrap();
+                let exists = directory
+                    .exists(&txn, vec![])
+                    .await
+                    .expect("could not list directory");
+
                 let key_exists = subspace.pack(&(String::from("exists")));
-                let value_exists = pack(&(exists as i32));
+                let value_exists = pack(&Element::Tuple(vec![Element::Int(match exists {
+                    true => 1,
+                    false => 0,
+                })]));
 
                 let children = if exists {
                     directory.list(txn, vec![]).await.unwrap()
                 } else {
                     vec![]
                 };
+
+                let tuple_children = Element::Tuple(
+                    children
+                        .iter()
+                        .map(|s| Element::String(Cow::Owned(s.clone())))
+                        .collect(),
+                );
+
                 let key_children = subspace.pack(&(String::from("children")));
-                let value_children = pack(&children);
+                let value_children = pack(&tuple_children);
 
                 txn.set(&key_path, &value_path);
+                println!(
+                    "[{}] {:?}={:?}",
+                    self.directory_index,
+                    unpack::<Vec<Element>>(&key_path).unwrap(),
+                    unpack::<Vec<Element>>(&value_path).unwrap(),
+                );
                 txn.set(&key_layer, &value_layer);
+                println!(
+                    "[{}] {:?}={:?}",
+                    self.directory_index,
+                    unpack::<Vec<Element>>(&key_layer).unwrap(),
+                    unpack::<Vec<Element>>(&value_layer).unwrap(),
+                );
                 txn.set(&key_exists, &value_exists);
+                println!(
+                    "[{}] {:?}={:?}",
+                    self.directory_index,
+                    unpack::<Vec<Element>>(&key_exists).unwrap(),
+                    unpack::<Vec<Element>>(&value_exists).unwrap(),
+                );
                 txn.set(&key_children, &value_children);
+                println!(
+                    "[{}] {:?}={:?}",
+                    self.directory_index,
+                    unpack::<Vec<Element>>(&key_children).unwrap(),
+                    unpack::<Vec<Element>>(&value_children).unwrap(),
+                );
             }
 
             // Use the current directory for this operation.
@@ -2292,26 +2478,32 @@ impl StackMachine {
             // subspace and store the result as [prefix]. Throw an error if the popped
             // array does not start with prefix. Otherwise, remove the prefix from the
             // popped array and push the result onto the stack.
-            DirectoryStripPrefix => {
-                debug!("directory_strip_prefix stack: {:?}", self.stack);
-                let raw_prefix = self.pop_bytes().await;
-                let subspace_bytes_length =
-                    self.get_current_directory_subspace().unwrap().bytes().len();
-                if raw_prefix.len() != subspace_bytes_length {
+            DirectoryStripPrefix => match self.pop_optional_bytes().await {
+                None => {
                     self.push_directory_err(
                         &instr.code,
                         number,
-                        DirectoryError::Version(String::from(
-                            "String does not start with raw prefix",
-                        )),
-                    );
-                } else {
-                    self.push(
-                        number,
-                        Element::Bytes(Bytes::from(raw_prefix[subspace_bytes_length..].to_owned())),
+                        DirectoryError::Other(String::from("bad input on bytes")),
                     );
                 }
-            }
+                Some(raw_prefix) => {
+                    let ssb = self.get_current_directory_subspace_bytes().unwrap();
+                    if !raw_prefix.to_vec().starts_with(&ssb) {
+                        self.push_directory_err(
+                            &instr.code,
+                            number,
+                            DirectoryError::Version(String::from(
+                                "String does not start with raw prefix",
+                            )),
+                        );
+                    } else {
+                        self.push(
+                            number,
+                            Element::Bytes(Bytes::from(raw_prefix[ssb.len()..].to_owned())),
+                        );
+                    }
+                }
+            },
         }
 
         if is_db && pending {
@@ -2352,13 +2544,17 @@ impl StackMachine {
             handle.join().expect("joined thread to not panic");
         }
     }
-    fn get_current_directory_layer(&self) -> Option<Box<dyn Directory>> {
-        debug!("current directory is at index {}", self.directory_index);
+
+    fn get_current_item(&self) -> Option<&DirectoryStackItem> {
+        self.directory_stack.get(self.directory_index)
+    }
+
+    fn get_current_directory(&self) -> Option<Box<dyn Directory>> {
         match self.directory_stack.get(self.directory_index) {
             None => None,
             Some(directory_or_subspace) => match directory_or_subspace {
                 DirectoryStackItem::Directory(d) => Some(Box::new(d.clone())),
-                DirectoryStackItem::DirectorySubspace(d) => Some(Box::new((*d).clone())),
+                DirectoryStackItem::DirectoryOutput(d) => Some(Box::new((*d).clone())),
                 _ => None,
             },
         }
@@ -2368,7 +2564,7 @@ impl StackMachine {
         match self.directory_stack.get(self.directory_index) {
             None => None,
             Some(directory_or_subspace) => match directory_or_subspace {
-                DirectoryStackItem::DirectorySubspace(d) => Some(d.pack(v)),
+                DirectoryStackItem::DirectoryOutput(d) => Some(d.pack(v)),
                 DirectoryStackItem::Subspace(d) => Some(d.pack(v)),
                 _ => None,
             },
@@ -2382,7 +2578,7 @@ impl StackMachine {
         match self.directory_stack.get(self.directory_index) {
             None => None,
             Some(directory_or_subspace) => match directory_or_subspace {
-                DirectoryStackItem::DirectorySubspace(d) => Some(d.unpack(key)),
+                DirectoryStackItem::DirectoryOutput(d) => Some(d.unpack(key)),
                 DirectoryStackItem::Subspace(d) => Some(d.unpack(key)),
                 _ => None,
             },
@@ -2393,19 +2589,44 @@ impl StackMachine {
         match self.directory_stack.get(self.directory_index) {
             None => None,
             Some(directory_or_subspace) => match directory_or_subspace {
-                DirectoryStackItem::DirectorySubspace(d) => Some(d.subspace(t)),
+                DirectoryStackItem::DirectoryOutput(d) => Some(d.subspace(t)),
                 DirectoryStackItem::Subspace(d) => Some(d.subspace(t)),
                 _ => None,
             },
         }
     }
 
-    fn get_current_directory_subspace(&self) -> Option<DirectorySubspace> {
-        debug!("current directory is at index {}", self.directory_index);
+    fn get_current_directory_path(&self) -> Option<Vec<String>> {
         match self.directory_stack.get(self.directory_index) {
             None => None,
             Some(directory_or_subspace) => match directory_or_subspace {
-                DirectoryStackItem::DirectorySubspace(d) => Some(d.clone()),
+                DirectoryStackItem::Directory(d) => Some(d.get_path()),
+                DirectoryStackItem::DirectoryOutput(d) => Some(d.get_path()),
+                _ => None,
+            },
+        }
+    }
+
+    fn get_current_directory_layer(&self) -> Option<Vec<u8>> {
+        match self.directory_stack.get(self.directory_index) {
+            None => None,
+            Some(directory_or_subspace) => match directory_or_subspace {
+                DirectoryStackItem::DirectoryOutput(d) => Some(d.get_layer()),
+                DirectoryStackItem::Directory(_) => Some(vec![]),
+                _ => None,
+            },
+        }
+    }
+
+    fn get_current_directory_subspace_bytes(&self) -> Option<Vec<u8>> {
+        match self.directory_stack.get(self.directory_index) {
+            None => None,
+            Some(directory_or_subspace) => match directory_or_subspace {
+                DirectoryStackItem::DirectoryOutput(d) => match d {
+                    DirectoryOutput::DirectorySubspace(s) => Some(Vec::from(s.bytes())),
+                    DirectoryOutput::DirectoryPartition(_) => None,
+                },
+                DirectoryStackItem::Subspace(subspace) => Some(Vec::from(subspace.bytes())),
                 _ => None,
             },
         }

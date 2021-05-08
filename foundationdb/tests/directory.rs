@@ -5,16 +5,18 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use foundationdb::directory::directory_layer::DirectoryLayer;
+use foundationdb::directory::directory_layer::{DirectoryLayer, DEFAULT_NODE_PREFIX};
 use foundationdb::directory::directory_subspace::DirectorySubspace;
 use foundationdb::directory::error::DirectoryError;
-use foundationdb::directory::Directory;
-use foundationdb::{Database, FdbResult};
+use foundationdb::directory::{Directory, DirectoryOutput};
+
+use foundationdb::tuple::Subspace;
+use foundationdb::*;
 
 mod common;
 
 #[test]
-fn test_create_or_open_directory() {
+fn test_directory() {
     let _guard = unsafe { foundationdb::boot() };
     let db = futures::executor::block_on(common::database()).expect("cannot open fdb");
 
@@ -26,14 +28,10 @@ fn test_create_or_open_directory() {
     eprintln!("creating directories");
     let directory = DirectoryLayer::default();
 
-    let trx = db.create_trx().expect("cannot create txn");
-    trx.clear_range(b"", b"\xff");
-    futures::executor::block_on(trx.commit()).expect("could not clear keys");
-
     futures::executor::block_on(test_create_then_open_then_delete(
         &db,
         &directory,
-        vec![String::from("1")],
+        vec![String::from("application")],
     ))
     .expect("failed to run");
 

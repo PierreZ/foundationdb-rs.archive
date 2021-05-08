@@ -16,6 +16,8 @@ use std::io;
 /// The enumeration holding all possible errors from a Directory.
 #[derive(Debug)]
 pub enum DirectoryError {
+    Other(String),
+    OperationNotAllowedOnDirectoryPartition,
     CannotModifyRootDirectory,
     DirectoryPrefixInUse,
     DirectoryDoesNotExists,
