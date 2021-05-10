@@ -466,8 +466,6 @@ impl DirectoryLayer {
 
         let node = self.find(trx, path.to_owned()).await?;
 
-        dbg!(&node);
-
         if !node.exists() {
             return Ok(false);
         }

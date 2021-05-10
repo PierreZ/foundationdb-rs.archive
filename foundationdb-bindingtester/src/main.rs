@@ -728,6 +728,7 @@ impl StackMachine {
         self.push(number, Element::Tuple(vec![ERROR_DIRECTORY.clone()]));
 
         if let InstrCode::DirectoryCreateSubspace
+        | InstrCode::DirectoryCreateOrOpen
         | InstrCode::DirectoryCreateLayer
         | InstrCode::DirectoryCreate
         | InstrCode::DirectoryOpen
@@ -737,7 +738,7 @@ impl StackMachine {
         {
             error!(
                 "pushed NULL in the directory_stack at index {} because of the error",
-                self.directory_stack.len()
+                self.directory_stack.len() + 1
             );
             self.directory_stack.push(DirectoryStackItem::Null);
         }
@@ -1659,7 +1660,7 @@ impl StackMachine {
                 debug!(
                     "pushing a new subspace {:?} at index {}",
                     &subspace,
-                    self.directory_stack.len()
+                    self.directory_stack.len() + 1
                 );
                 self.directory_stack
                     .push(DirectoryStackItem::Subspace(subspace));
@@ -1700,7 +1701,10 @@ impl StackMachine {
                         _ => panic!("expecting subspace"),
                     };
 
-                    debug!("pushed a directory at index {}", self.directory_stack.len());
+                    debug!(
+                        "pushed a directory at index {}",
+                        self.directory_stack.len() + 1
+                    );
 
                     self.directory_stack
                         .push(DirectoryStackItem::Directory(DirectoryLayer::new(
@@ -1755,7 +1759,7 @@ impl StackMachine {
                     Ok(directory_subspace) => {
                         debug!(
                             "pushing DirectoryOutput at index {}",
-                            self.directory_stack.len()
+                            self.directory_stack.len() + 1
                         );
                         self.directory_stack
                             .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
@@ -1812,7 +1816,7 @@ impl StackMachine {
                     Ok(directory_subspace) => {
                         debug!(
                             "pushing newly opened DirectoryOutput at index {}",
-                            self.directory_stack.len()
+                            self.directory_stack.len() + 1
                         );
                         self.directory_stack
                             .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
@@ -1877,7 +1881,7 @@ impl StackMachine {
                         debug!(
                             "pushing created_or_opened {:?} at index {}",
                             &directory_subspace,
-                            self.directory_stack.len()
+                            self.directory_stack.len() + 1
                         );
                         self.directory_stack
                             .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
@@ -2390,11 +2394,7 @@ impl StackMachine {
             // Where log_subspace[u<str>] is the subspace packed tuple containing only the
             // single specified unicode string <str>.
             DirectoryLogDirectory => {
-                info!(
-                    "logging directory {}/{}",
-                    self.directory_index,
-                    self.directory_stack.len()
-                );
+                info!("logging directory {}", self.directory_index,);
                 let directory = self
                     .get_current_directory()
                     .expect("could not find a directory");
