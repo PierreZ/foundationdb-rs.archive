@@ -2259,7 +2259,7 @@ impl StackMachine {
                 let data: Vec<Element> = self.unpack_with_current_subspace(&data).unwrap().unwrap();
                 for element in data {
                     debug!(" - {:?}", element);
-                    self.push(number, element.into_owned());
+                    self.push(number, Element::Tuple(vec![element.into_owned()]));
                 }
             }
 
