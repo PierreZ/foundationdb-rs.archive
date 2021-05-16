@@ -69,6 +69,24 @@ impl DirectoryLayer {
         }
     }
 
+    pub(crate) fn new_with_path(
+        node_subspace: Subspace,
+        content_subspace: Subspace,
+        allow_manual_prefixes: bool,
+        path: Vec<String>,
+    ) -> Self {
+        let root_node = node_subspace.subspace(&node_subspace.bytes());
+
+        DirectoryLayer {
+            root_node: root_node.clone(),
+            node_subspace,
+            content_subspace,
+            allocator: HighContentionAllocator::new(root_node.subspace(&DEFAULT_HCA_PREFIX)),
+            allow_manual_prefixes,
+            path,
+        }
+    }
+
     pub fn get_path(&self) -> Vec<String> {
         self.path.clone()
     }
@@ -643,6 +661,7 @@ impl DirectoryLayer {
         }
 
         let node = self.find(&trx, path.to_owned()).await?;
+
         if !node.exists() {
             return if fail_on_nonexistent {
                 Err(DirectoryError::DirectoryDoesNotExists)
@@ -683,7 +702,6 @@ impl DirectoryLayer {
                 let sub_node = self.node_with_prefix(&row_key.value());
                 self.remove_recursive(trx, sub_node).await?;
                 begin = row_key.key().pack_to_vec();
-                begin.push(0);
             }
 
             if !has_more {
@@ -692,12 +710,10 @@ impl DirectoryLayer {
         }
 
         let mut node_prefix: Vec<u8> = self.node_subspace.unpack(node_sub.bytes())?;
+        let node_prefix_subspace = Subspace::from_bytes(&node_prefix);
 
-        // equivalent of strinc?
-        node_prefix.remove(node_prefix.len() - 1);
-
-        trx.clear_range(node_prefix.as_slice(), node_prefix.as_slice());
         trx.clear_subspace_range(&node_sub);
+        trx.clear_subspace_range(&node_prefix_subspace);
 
         Ok(())
     }

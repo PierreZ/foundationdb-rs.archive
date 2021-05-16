@@ -22,13 +22,14 @@ impl DirectoryPartition {
         node_subspace_bytes.extend_from_slice(&prefix);
         node_subspace_bytes.extend_from_slice(DEFAULT_NODE_PREFIX);
 
-        let new_directory_layer = DirectoryLayer::new(
+        let new_directory_layer = DirectoryLayer::new_with_path(
             Subspace::from_bytes(&node_subspace_bytes),
             Subspace::from_bytes(prefix.clone().as_slice()),
             false,
+            path.to_vec(),
         );
 
-        let mut d = DirectoryPartition {
+        DirectoryPartition {
             directory_subspace: DirectorySubspace::new(
                 path.clone(),
                 prefix.clone(),
@@ -36,18 +37,22 @@ impl DirectoryPartition {
                 Vec::from(PARTITION_LAYER),
             ),
             parent_directory_layer,
-        };
-
-        // https://github.com/apple/foundationdb/blob/master/bindings/flow/DirectoryPartition.h#L42 ??
-        d.parent_directory_layer.path = path.to_vec();
-
-        d
+        }
     }
 }
 
 impl DirectoryPartition {
     pub fn get_path(&self) -> Vec<String> {
         self.directory_subspace.get_path()
+    }
+
+    fn get_partition_subpath(&self, path: Vec<String>) -> Vec<String> {
+        let mut new_path = vec![];
+
+        new_path.extend_from_slice(&self.get_path());
+        new_path.extend_from_slice(&path);
+
+        new_path
     }
 
     pub fn get_layer(&self) -> Vec<u8> {
@@ -91,7 +96,13 @@ impl Directory for DirectoryPartition {
     }
 
     async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        self.directory_subspace.exists(trx, path).await
+        if path.is_empty() {
+            self.parent_directory_layer
+                .exists(trx, self.get_partition_subpath(path))
+                .await
+        } else {
+            self.directory_subspace.exists(trx, path).await
+        }
     }
 
     async fn move_directory(
@@ -114,7 +125,13 @@ impl Directory for DirectoryPartition {
     }
 
     async fn remove(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
-        self.directory_subspace.remove(trx, path).await
+        if path.is_empty() {
+            self.parent_directory_layer
+                .remove(trx, self.get_partition_subpath(path))
+                .await
+        } else {
+            self.directory_subspace.remove(trx, path).await
+        }
     }
 
     async fn list(
@@ -122,6 +139,12 @@ impl Directory for DirectoryPartition {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
-        self.directory_subspace.list(trx, path).await
+        if path.is_empty() {
+            self.parent_directory_layer
+                .list(trx, self.get_partition_subpath(path))
+                .await
+        } else {
+            self.directory_subspace.list(trx, path).await
+        }
     }
 }

@@ -738,7 +738,7 @@ impl StackMachine {
         {
             error!(
                 "pushed NULL in the directory_stack at index {} because of the error",
-                self.directory_stack.len() + 1
+                self.directory_stack.len()
             );
             self.directory_stack.push(DirectoryStackItem::Null);
         }
@@ -1660,7 +1660,7 @@ impl StackMachine {
                 debug!(
                     "pushing a new subspace {:?} at index {}",
                     &subspace,
-                    self.directory_stack.len() + 1
+                    self.directory_stack.len()
                 );
                 self.directory_stack
                     .push(DirectoryStackItem::Subspace(subspace));
@@ -1701,10 +1701,7 @@ impl StackMachine {
                         _ => panic!("expecting subspace"),
                     };
 
-                    debug!(
-                        "pushed a directory at index {}",
-                        self.directory_stack.len() + 1
-                    );
+                    debug!("pushed a directory at index {}", self.directory_stack.len());
 
                     self.directory_stack
                         .push(DirectoryStackItem::Directory(DirectoryLayer::new(
@@ -1759,7 +1756,7 @@ impl StackMachine {
                     Ok(directory_subspace) => {
                         debug!(
                             "pushing DirectoryOutput at index {}",
-                            self.directory_stack.len() + 1
+                            self.directory_stack.len()
                         );
                         self.directory_stack
                             .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
@@ -1816,7 +1813,7 @@ impl StackMachine {
                     Ok(directory_subspace) => {
                         debug!(
                             "pushing newly opened DirectoryOutput at index {}",
-                            self.directory_stack.len() + 1
+                            self.directory_stack.len()
                         );
                         self.directory_stack
                             .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
@@ -1881,7 +1878,7 @@ impl StackMachine {
                         debug!(
                             "pushing created_or_opened {:?} at index {}",
                             &directory_subspace,
-                            self.directory_stack.len() + 1
+                            self.directory_stack.len()
                         );
                         self.directory_stack
                             .push(DirectoryStackItem::DirectoryOutput(directory_subspace));

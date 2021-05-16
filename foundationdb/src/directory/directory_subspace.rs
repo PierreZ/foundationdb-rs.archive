@@ -32,8 +32,8 @@ impl DirectorySubspace {
     fn get_partition_subpath(&self, path: Vec<String>) -> Vec<String> {
         let mut new_path = vec![];
 
-        new_path.extend_from_slice(&self.path[self.directory_layer.path.len()..]);
-        new_path.extend_from_slice(path.as_slice());
+        new_path.extend_from_slice(&self.path);
+        new_path.extend_from_slice(&path);
 
         new_path
     }
