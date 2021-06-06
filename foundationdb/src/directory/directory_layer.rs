@@ -2,7 +2,7 @@ use crate::directory::directory_partition::DirectoryPartition;
 use crate::directory::directory_subspace::DirectorySubspace;
 use crate::directory::error::DirectoryError;
 use crate::directory::node::Node;
-use crate::directory::{compare_slice, Directory, DirectoryOutput};
+use crate::directory::{compare_slice, strinc, Directory, DirectoryOutput};
 use crate::future::{FdbKeyValue, FdbSlice, FdbValues};
 use crate::tuple::hca::HighContentionAllocator;
 use crate::tuple::{unpack, Element, Subspace, TuplePack};
@@ -485,6 +485,7 @@ impl DirectoryLayer {
         let node = self.find(trx, path.to_owned()).await?;
 
         if !node.exists() {
+            println!("node does not exists");
             return Ok(false);
         }
 
@@ -513,13 +514,15 @@ impl DirectoryLayer {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
+        dbg!(&self.path, &path, &self.root_node.bytes());
         self.check_version(trx, false).await?;
 
         let node = self.find(trx, path.to_owned()).await?;
         if !node.exists() {
             return Err(DirectoryError::PathDoesNotExists);
         }
-        if node.is_in_partition(false) {
+        dbg!(&node);
+        if node.is_in_partition(true) {
             let subspace_node = match node.subspace {
                 // not reachable because `self.find` is creating a node with a subspace.
                 None => unreachable!("node's subspace is not set"),
@@ -709,11 +712,10 @@ impl DirectoryLayer {
             }
         }
 
-        let mut node_prefix: Vec<u8> = self.node_subspace.unpack(node_sub.bytes())?;
-        let node_prefix_subspace = Subspace::from_bytes(&node_prefix);
+        let node_prefix: Vec<u8> = self.node_subspace.unpack(node_sub.bytes())?;
 
+        trx.clear_range(node_prefix.as_slice(), &strinc(node_prefix.to_vec()));
         trx.clear_subspace_range(&node_sub);
-        trx.clear_subspace_range(&node_prefix_subspace);
 
         Ok(())
     }

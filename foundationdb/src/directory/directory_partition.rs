@@ -29,7 +29,7 @@ impl DirectoryPartition {
             path.to_vec(),
         );
 
-        DirectoryPartition {
+        let mut d = DirectoryPartition {
             directory_subspace: DirectorySubspace::new(
                 path.clone(),
                 prefix.clone(),
@@ -37,7 +37,11 @@ impl DirectoryPartition {
                 Vec::from(PARTITION_LAYER),
             ),
             parent_directory_layer,
-        }
+        };
+
+        d.parent_directory_layer.path = path;
+
+        d
     }
 }
 
@@ -46,7 +50,7 @@ impl DirectoryPartition {
         self.directory_subspace.get_path()
     }
 
-    fn get_partition_subpath(&self, path: Vec<String>) -> Vec<String> {
+    pub(crate) fn get_partition_subpath(&self, path: Vec<String>) -> Vec<String> {
         let mut new_path = vec![];
 
         new_path.extend_from_slice(&self.get_path());
@@ -97,9 +101,7 @@ impl Directory for DirectoryPartition {
 
     async fn exists(&self, trx: &Transaction, path: Vec<String>) -> Result<bool, DirectoryError> {
         if path.is_empty() {
-            self.parent_directory_layer
-                .exists(trx, self.get_partition_subpath(path))
-                .await
+            self.parent_directory_layer.exists(trx, path).await
         } else {
             self.directory_subspace.exists(trx, path).await
         }

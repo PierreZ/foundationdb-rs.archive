@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
 pub struct DirectorySubspace {
-    directory_layer: DirectoryLayer,
+    pub(crate) directory_layer: DirectoryLayer,
     subspace: Subspace,
     path: Vec<String>,
     layer: Vec<u8>,
@@ -175,6 +175,7 @@ impl Directory for DirectorySubspace {
         trx: &Transaction,
         path: Vec<String>,
     ) -> Result<Vec<String>, DirectoryError> {
+        dbg!(&path);
         self.directory_layer
             .list(trx, self.get_partition_subpath(path.to_owned()))
             .await

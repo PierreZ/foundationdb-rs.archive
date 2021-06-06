@@ -41,6 +41,7 @@ use foundationdb::directory::error::DirectoryError;
 use foundationdb::directory::{Directory, DirectoryOutput};
 use foundationdb::tuple::{PackResult, TupleUnpack};
 
+use std::ops::Deref;
 use tuple::VersionstampOffset;
 
 fn mutation_from_str(s: &str) -> MutationType {
@@ -1812,8 +1813,9 @@ impl StackMachine {
                 {
                     Ok(directory_subspace) => {
                         debug!(
-                            "pushing newly opened DirectoryOutput at index {}",
-                            self.directory_stack.len()
+                            "pushing newly opened DirectoryOutput at index {}: {:?}",
+                            self.directory_stack.len(),
+                            &directory_subspace
                         );
                         self.directory_stack
                             .push(DirectoryStackItem::DirectoryOutput(directory_subspace));
@@ -1862,7 +1864,7 @@ impl StackMachine {
                 debug!(
                     "create_or_open path {:?} with layer {:?} with index {}",
                     path.get(0).unwrap(),
-                    &layer,
+                    String::from_utf8(layer.clone().unwrap_or(vec![])),
                     self.directory_index
                 );
                 match directory
@@ -2064,7 +2066,7 @@ impl StackMachine {
                 match directory.remove(txn, paths.to_owned()).await {
                     Ok(_) => {
                         if is_db {
-                            info!("toto commiting local trx");
+                            info!("commiting local trx");
                             local_trx.commit().await.expect("could not commit");
                         }
                     }
@@ -2391,7 +2393,6 @@ impl StackMachine {
             // Where log_subspace[u<str>] is the subspace packed tuple containing only the
             // single specified unicode string <str>.
             DirectoryLogDirectory => {
-                info!("logging directory {}", self.directory_index,);
                 let directory = self
                     .get_current_directory()
                     .expect("could not find a directory");
@@ -2412,6 +2413,9 @@ impl StackMachine {
                 let key_layer = subspace.pack(&(String::from("layer")));
                 let value_layer = pack(&self.get_current_directory_layer().unwrap());
 
+                // TODO(PZ): fix
+                // rust   - ('tester_output', 'stack', 22, 152) = '\x01DIRECTORY_ERROR\x00'
+                // Test with seed 2326506923 and concurrency 1 had 7 incorrect result(s) and 0 error(s) at API version 610
                 let exists = directory
                     .exists(&txn, vec![])
                     .await
@@ -2424,6 +2428,7 @@ impl StackMachine {
                 })]));
 
                 let children = if exists {
+                    debug!(" directory exists, listing child");
                     directory.list(txn, vec![]).await.unwrap()
                 } else {
                     vec![]
@@ -2514,10 +2519,6 @@ impl StackMachine {
             self.push(number, RESULT_NOT_PRESENT.clone().into_owned());
         } else if !self.transactions.contains_key(&self.cur_transaction) {
             self.transactions.insert(self.cur_transaction.clone(), trx);
-        }
-
-        if instr.has_flags() {
-            panic!("flag not handled for instr: {:?}", instr);
         }
 
         Ok(())
