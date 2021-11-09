@@ -18,6 +18,8 @@ fn test_range() {
     futures::executor::block_on(test_get_range_async()).expect("failed to run");
     futures::executor::block_on(test_range_option_async()).expect("failed to run");
     futures::executor::block_on(test_get_ranges_async()).expect("failed to run");
+    #[cfg(feature = "fdb-7_0")]
+    futures::executor::block_on(test_get_range_split_points()).expect("failed to run");
 }
 
 async fn test_get_range_async() -> FdbResult<()> {
@@ -200,6 +202,32 @@ async fn test_range_option_async() -> FdbResult<()> {
             4901
         );
     }
+
+    Ok(())
+}
+async fn test_get_range_split_points() -> FdbResult<()> {
+    const N: u32 = 10000;
+
+    let db = common::database().await?;
+    let trx = db.create_trx()?;
+    let key_begin = "test-split-point-";
+    let key_end = "test-split-point.";
+    let k = |i: u32| format!("{}-{:010}", key_begin, i);
+
+    eprintln!("clearing...");
+    trx.clear_range(key_begin.as_bytes(), key_end.as_bytes());
+
+    eprintln!("inserting...");
+    for i in 0..N {
+        let value = common::random_str(10);
+        trx.set(k(i).as_bytes(), value.as_bytes());
+    }
+    trx.commit().await?;
+
+    let trx = db.create_trx()?;
+    let splits = trx
+        .get_range_split_points(key_begin.as_bytes(), key_end.as_bytes(), 100)
+        .await?;
 
     Ok(())
 }
