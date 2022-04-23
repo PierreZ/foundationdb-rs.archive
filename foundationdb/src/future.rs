@@ -235,6 +235,7 @@ impl AsRef<[FdbAddress]> for FdbAddresses {
 /// can never own a FdbAddress directly, you can only have references to it.
 /// This way, you can never obtain a lifetime greater than the lifetime of the
 /// slice that gave you access to it.
+#[repr(transparent)]
 pub struct FdbAddress {
     c_str: *const c_char,
 }
@@ -253,6 +254,7 @@ impl AsRef<CStr> for FdbAddress {
 }
 
 /// An slice of keys owned by a FoundationDB future
+#[cfg(feature = "fdb-7_0")]
 pub struct FdbKeys {
     _f: FdbFutureHandle,
     keys: *const fdb_sys::FDBKey,
@@ -268,13 +270,7 @@ impl TryFrom<FdbFutureHandle> for FdbKeys {
         let mut keys = std::ptr::null();
         let mut len = 0;
 
-        unsafe {
-            error::eval(fdb_sys::fdb_future_get_key_array(
-                f.as_ptr(),
-                &mut keys,
-                &mut len,
-            ))?
-        }
+        error::eval(unsafe { fdb_sys::fdb_future_get_key_array(f.as_ptr(), &mut keys, &mut len) })?;
 
         Ok(FdbKeys { _f: f, keys, len })
     }
@@ -643,6 +639,7 @@ impl TryFrom<FdbFutureHandle> for () {
     }
 }
 
+#[cfg(feature = "fdb-7_0")]
 #[repr(transparent)]
 pub struct FdbKey(fdb_sys::FDBKey);
 impl FdbKey {
